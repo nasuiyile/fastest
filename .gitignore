@@ -1,0 +1,87 @@
+# =========================
+# CLion / JetBrains
+# =========================
+.idea/
+*.iml
+
+# CLion / CMake build directories
+cmake-build-*/
+build/
+out/
+
+# =========================
+# CMake
+# =========================
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+compile_commands.json
+
+# CMake generated files
+install_manifest.txt
+Testing/
+
+# =========================
+# C / C++ compiled files
+# =========================
+*.o
+*.obj
+*.lo
+
+# Libraries
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Debug / profiling files
+*.dSYM/
+*.pdb
+*.ilk
+*.map
+*.gcda
+*.gcno
+*.gcov
+vcpkg_installed/
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# =========================
+# VS Code (optional)
+# =========================
+.vscode/
+
+# =========================
+# Conan / package managers
+# =========================
+conanbuildinfo.*
+conan.lock
+
+# =========================
+# Coverage
+# =========================
+coverage/
+*.profraw
+*.profdata
