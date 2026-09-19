@@ -6,15 +6,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Boost  CONFIG REQUIRED COMPONENTS asio)
+find_package(Boost CONFIG REQUIRED COMPONENTS asio)
 find_package(spdlog CONFIG REQUIRED)
-add_executable(fastest src/main.cpp)
+add_executable(fastest src/main.cpp
+        src/cache/core_cache.cpp
+        src/cache/core_cache.h)
+find_package(unofficial-numa CONFIG REQUIRED)
+#设置别名
+add_library(NUMA::NUMA ALIAS unofficial::numa::numa)
+find_package(magic_enum CONFIG REQUIRED)
 find_package(Catch2 3 REQUIRED)
-
+find_package(cachelib CONFIG REQUIRED)
 target_link_libraries(fastest
         PRIVATE
         Boost::asio
         spdlog::spdlog
+        cachelib
 )
 
 # =========================
@@ -26,13 +33,14 @@ target_link_libraries(fastest
 
 enable_testing()
 
-add_executable(fastest_tests src/tests/test_client.cpp)
+add_executable(fastest_tests tests/test_client.cpp)
 
 target_link_libraries(fastest_tests
         PRIVATE
         Boost::asio
         spdlog::spdlog
         Catch2::Catch2WithMain
+        cachelib
 )
 
 add_test(NAME fastest_tests COMMAND fastest_tests)
@@ -41,11 +49,11 @@ add_test(NAME fastest_tests COMMAND fastest_tests)
 # Platform specific backend
 # =========================
 
-if(WIN32)
+if (WIN32)
 
     message(STATUS "Boost.Asio backend: IOCP")
 
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     include(CheckCXXSourceCompiles)
 
@@ -64,7 +72,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     find_package(PkgConfig QUIET)
 
-    if(PkgConfig_FOUND)
+    if (PkgConfig_FOUND)
 
         # 这里只让 pkg-config 帮我们：
         # 1. 检查 liburing >= 2.0
@@ -78,9 +86,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 liburing>=2.0
         )
 
-    endif()
+    endif ()
 
-    if(LIBURING_FOUND)
+    if (LIBURING_FOUND)
 
         # 显式寻找静态库 liburing.a
         find_library(
@@ -89,9 +97,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 HINTS ${LIBURING_LIBRARY_DIRS}
         )
 
-    endif()
+    endif ()
 
-    if(HAVE_LINUX_5_10_HEADERS
+    if (HAVE_LINUX_5_10_HEADERS
             AND LIBURING_FOUND
             AND LIBURING_STATIC_LIBRARY)
 
@@ -117,10 +125,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 BOOST_ASIO_DISABLE_EPOLL
         )
 
-    else()
+    else ()
 
         message(STATUS "Boost.Asio backend: epoll")
 
-    endif()
+    endif ()
 
-endif()
+endif ()
