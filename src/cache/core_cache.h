@@ -51,7 +51,6 @@ namespace cache {
         template<typename CacheT>
         struct State {
             explicit State(const Config &config);
-
             CacheT cache;
             facebook::cachelib::PoolId poolId;
         };

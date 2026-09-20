@@ -6,6 +6,7 @@
 
 #include <spdlog/spdlog.h>
 #include <boost/asio.hpp>
+#include "protocol/memcahed_request.h"
 
 namespace asio = boost::asio;
 using asio::ip::tcp;
@@ -14,13 +15,93 @@ using asio::use_awaitable;
 
 static awaitable<void> session(tcp::socket socket) {
     try {
-        std::array<char, 4096> buffer{};
+        asio::streambuf buf;
+
         while (true) {
-            const std::size_t n = co_await socket.async_read_some(asio::buffer(buffer), use_awaitable);
-            co_await asio::async_write(socket, asio::buffer(buffer.data(), n), use_awaitable);
+            // 1) 读命令行（直到 \r\n）
+            co_await asio::async_read_until(socket, buf, "\r\n", use_awaitable);
+            std::string line = protocol::extract_line(buf);
+            if (line.empty()) continue;
+
+            auto tokens = protocol::split_ws(line);
+            if (tokens.empty()) continue;
+
+            protocol::MemcachedRequest req;
+            req.command = std::string(tokens[0]);
+
+            // 2) 存储类命令：解析 <key> <flags> <exptime> <bytes> [noreply]
+            if (protocol::is_storage_command(req.command)) {
+                if (tokens.size() < 5) {
+                    // 协议错误，可回写 ERROR
+                    const char *err = "ERROR\r\n";
+                    co_await asio::async_write(socket, asio::buffer(err, 7), use_awaitable);
+                    continue;
+                }
+                req.key = std::string(tokens[1]);
+                req.flags = std::string(tokens[2]);
+                req.exptime = std::string(tokens[3]);
+                std::size_t n = 0;
+                auto [p, ec] = std::from_chars(tokens[4].data(), tokens[4].data() + tokens[4].size(), n);
+                if (ec != std::errc{}) {
+                    const char *err = "CLIENT_ERROR bad command line format\r\n";
+                    co_await asio::async_write(socket, asio::buffer(err, std::strlen(err)), use_awaitable);
+                    continue;
+                }
+                req.bytes = n;
+                req.noreply = (tokens.size() >= 6 && tokens[5] == "noreply");
+                req.has_value = true;
+
+                // 3) 精确读 value + 结尾 \r\n
+                req.value.resize(req.bytes);
+                co_await asio::async_read(socket, asio::buffer(req.value.data(), req.bytes), use_awaitable);
+
+                // 读掉结尾的 \r\n（2 字节）
+                std::array<char, 2> crlf{};
+                co_await asio::async_read(socket, asio::buffer(crlf), use_awaitable);
+
+                spdlog::info("SET key={} flags={} exptime={} bytes={} noreply={}",
+                             req.key, req.flags, req.exptime, req.bytes, req.noreply);
+                spdlog::info("VALUE ({} bytes): [{}]", req.value.size(), req.value);
+
+                // 4) 处理业务逻辑后回写响应
+                if (!req.noreply) {
+                    const char *ok = "STORED\r\n";
+                    co_await asio::async_write(socket, asio::buffer(ok, std::strlen(ok)), use_awaitable);
+                }
+                continue;
+            }
+
+            // 5) 读取类命令：get <key> [<key> ...]
+            if (protocol::is_read_command(req.command)) {
+                // 这里可以逐个 key 查表并组装 VALUE ... END 响应
+                for (std::size_t i = 1; i < tokens.size(); ++i) {
+                    std::string key(tokens[i]);
+                    spdlog::info("GET key={}", key);
+                    // TODO: 从你的存储中查 key，组装响应
+                }
+                const char *end = "END\r\n";
+                co_await asio::async_write(socket, asio::buffer(end, std::strlen(end)), use_awaitable);
+                continue;
+            }
+
+            // 6) delete <key> [noreply]
+            if (protocol::is_delete_command(req.command)) {
+                if (tokens.size() >= 2) {
+                    req.key = std::string(tokens[1]);
+                    spdlog::info("DELETE key={}", req.key);
+                }
+                const char *ok = "DELETED\r\n";
+                co_await asio::async_write(socket, asio::buffer(ok, std::strlen(ok)), use_awaitable);
+                continue;
+            }
+
+            // 7) 其他命令（stats/version/quit...）可按需扩展
+            const char *err = "ERROR\r\n";
+            co_await asio::async_write(socket, asio::buffer(err, std::strlen(err)), use_awaitable);
         }
     } catch (const boost::system::system_error &e) {
-        if (e.code() != asio::error::eof &&e.code() != asio::error::connection_reset) {
+        if (e.code() != asio::error::eof &&
+            e.code() != asio::error::connection_reset) {
             spdlog::error("session error {}", e.what());
         }
     }

@@ -111,9 +111,9 @@ namespace cache {
     decltype(auto) CoreCache::dispatch(F &&f) {
         switch (state_.index()) {
             case 0:
-                return std::forward<F>(f)(std::get<0>(state_));
+                return f(std::get<0>(state_));
             case 1:
-                return std::forward<F>(f)(std::get<1>(state_));
+                return f(std::get<1>(state_));
             default:
                 std::terminate();
         }

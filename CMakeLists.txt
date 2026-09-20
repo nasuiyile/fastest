@@ -10,7 +10,9 @@ find_package(Boost CONFIG REQUIRED COMPONENTS asio)
 find_package(spdlog CONFIG REQUIRED)
 add_executable(fastest src/main.cpp
         src/cache/core_cache.cpp
-        src/cache/core_cache.h)
+        src/cache/core_cache.h
+        src/protocol/memcahed_request.cpp
+        src/protocol/memcahed_request.h)
 find_package(unofficial-numa CONFIG REQUIRED)
 #设置别名
 add_library(NUMA::NUMA ALIAS unofficial::numa::numa)

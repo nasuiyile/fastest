@@ -5,6 +5,8 @@ sudo apt update
 
 sudo apt install htop
 
+sudo apt install -y libnuma1 libnuma-dev 
+
 sudo apt install -y \
     build-essential \
     cmake \
@@ -14,7 +16,8 @@ sudo apt install -y \
     zip \
     unzip \
     tar \
-    pkg-config
+    pkg-config \
+    gdb
 
 cd ~
 
