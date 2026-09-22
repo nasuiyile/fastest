@@ -19,6 +19,9 @@ add_executable(fastest
         src/protocol/memcahed_request.h
         src/server/fastest_server.cpp
         src/server/fastest_server.h
+        src/cache/core_cache.h
+        src/cache/core_cache.cpp
+        src/cache/core_cache.h
 )
 
 target_compile_features(fastest PRIVATE cxx_std_20)
