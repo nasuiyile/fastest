@@ -6,46 +6,47 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# clangd
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 find_package(Boost CONFIG REQUIRED COMPONENTS asio)
 find_package(spdlog CONFIG REQUIRED)
-add_executable(fastest src/main.cpp
-        src/cache/core_cache.cpp
-        src/cache/core_cache.h
-        src/protocol/memcahed_request.cpp
-        src/protocol/memcahed_request.h)
-find_package(unofficial-numa CONFIG REQUIRED)
-#设置别名
-add_library(NUMA::NUMA ALIAS unofficial::numa::numa)
-find_package(magic_enum CONFIG REQUIRED)
 find_package(Catch2 3 REQUIRED)
-find_package(cachelib CONFIG REQUIRED)
+
+add_executable(fastest
+        src/main.cpp
+        src/protocol/memcahed_request.cpp
+        src/protocol/memcahed_request.h
+        src/server/fastest_server.cpp
+        src/server/fastest_server.h
+)
+
+target_compile_features(fastest PRIVATE cxx_std_20)
+
 target_link_libraries(fastest
         PRIVATE
         Boost::asio
         spdlog::spdlog
-        cachelib
 )
-
-# =========================
-# TCP echo 测试客户端
-# =========================
-# 用 Catch2 写的客户端测试：连接到已经在运行的 fastest（127.0.0.1:9000），
-# 通过发送/接收数据来验证 main.cpp 里的 echo 逻辑是否正确。
-# 不负责拉起 server，跑测试前需要先手动启动 fastest。
 
 enable_testing()
 
-add_executable(fastest_tests tests/test_client.cpp)
+add_executable(fastest_tests
+        tests/test_client.cpp
+)
+
+target_compile_features(fastest_tests PRIVATE cxx_std_20)
 
 target_link_libraries(fastest_tests
         PRIVATE
         Boost::asio
         spdlog::spdlog
         Catch2::Catch2WithMain
-        cachelib
 )
 
 add_test(NAME fastest_tests COMMAND fastest_tests)
+
+# 后面保持你的 WIN32/Linux io_uring 配置
 
 # =========================
 # Platform specific backend

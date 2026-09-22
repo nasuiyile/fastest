@@ -5,9 +5,6 @@
     "boost-asio",
     "spdlog",
     "catch2",
-    "cachelib",
-    "numactl",
-    "magic-enum",
     {
       "name": "liburing",
       "platform": "linux"

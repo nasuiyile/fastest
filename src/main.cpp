@@ -13,6 +13,7 @@ using asio::ip::tcp;
 using asio::awaitable;
 using asio::use_awaitable;
 
+
 static awaitable<void> session(tcp::socket socket) {
     try {
         asio::streambuf buf;
@@ -62,6 +63,7 @@ static awaitable<void> session(tcp::socket socket) {
                 spdlog::info("SET key={} flags={} exptime={} bytes={} noreply={}",
                              req.key, req.flags, req.exptime, req.bytes, req.noreply);
                 spdlog::info("VALUE ({} bytes): [{}]", req.value.size(), req.value);
+
 
                 // 4) 处理业务逻辑后回写响应
                 if (!req.noreply) {
