@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Boost CONFIG REQUIRED COMPONENTS asio)
+find_package(Boost CONFIG REQUIRED COMPONENTS asio intrusive)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Catch2 3 REQUIRED)
 
@@ -26,6 +26,7 @@ target_compile_features(fastest PRIVATE cxx_std_20)
 target_link_libraries(fastest
         PRIVATE
         Boost::asio
+        Boost::intrusive
         spdlog::spdlog
 )
 
@@ -40,6 +41,7 @@ target_compile_features(fastest_tests PRIVATE cxx_std_20)
 target_link_libraries(fastest_tests
         PRIVATE
         Boost::asio
+        Boost::intrusive
         spdlog::spdlog
         Catch2::Catch2WithMain
 )
