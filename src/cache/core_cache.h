@@ -144,7 +144,7 @@ private:
 	                              bi::equal<NodeEqual>,
 	                              bi::constant_time_size<false>,
 	                              bi::cache_begin<true>,
-	                              bi::power_2_buckets<true> >;
+	                              bi::power_2_buckets<true> >; //桶数量强制为2的幂
 
 	using bucket_type = typename Set::bucket_type;
 	using bucket_traits = typename Set::bucket_traits;
