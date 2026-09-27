@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(fastest LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,7 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # =========================
 # Dependencies
 # =========================
-find_package(Boost CONFIG REQUIRED COMPONENTS asio intrusive system)
+find_package(Boost CONFIG REQUIRED COMPONENTS asio intrusive system lockfree)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Catch2 3 REQUIRED)
 
@@ -21,12 +20,15 @@ find_package(Catch2 3 REQUIRED)
 # =========================
 add_executable(fastest
         src/main.cpp
-        src/protocol/memcahed_request.cpp
         src/protocol/memcahed_request.h
         src/server/fastest_server.h
         src/cache/core_cache.h
         src/cache/core_cache.cpp
         src/server/config.h
+        src/util/hardware_info.h
+        src/server/mailbox.h
+        src/server/shard_registry.h
+        src/server/worker.h
 )
 
 target_link_libraries(fastest
@@ -34,6 +36,7 @@ target_link_libraries(fastest
         Boost::asio
         Boost::intrusive
         Boost::system
+        Boost::lockfree
         spdlog::spdlog
 )
 

@@ -30,7 +30,7 @@ using asio::ip::tcp;
 namespace {
 
 constexpr const char *kHost = "127.0.0.1";
-constexpr unsigned short kPort = 9000;
+constexpr unsigned short kPort = 2333;
 constexpr auto kIoTimeout = std::chrono::seconds(5);
 
 // 建立一条到 server 的连接，失败直接抛异常（Catch2 会报成用例失败）。
