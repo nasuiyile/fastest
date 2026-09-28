@@ -27,19 +27,26 @@ namespace bi = boost::intrusive;
 
 class FastByteHash {
 public:
-	explicit constexpr FastByteHash(std::uint64_t seed = 0x9e3779b97f4a7c15ULL) noexcept : seed_(seed) {
+	static constexpr std::uint64_t goldenRatio = 0x9e3779b97f4a7c15ULL;
+
+	explicit constexpr FastByteHash(const std::uint64_t seed = goldenRatio) noexcept : seed_(seed) {
 	}
 
-	std::uint64_t operator()(std::span<const std::byte> key) const noexcept {
+	std::uint64_t operator()(const std::span<const std::byte> key) const noexcept {
 		const auto *p = key.data();
 		std::size_t n = key.size();
 
-		std::uint64_t h = mix(seed_ ^ (static_cast<std::uint64_t>(n) * 0x9e3779b97f4a7c15ULL));
+		std::uint64_t h = mix(seed_ ^ (static_cast<std::uint64_t>(n) * goldenRatio));
 
 		while (n >= sizeof(std::uint64_t)) {
 			std::uint64_t word;
 			std::memcpy(&word, p, sizeof(word));
-
+			//wyhash常量
+			/*
+			* 0xa0761d6478bd642f 用来和每个 64 位字相加，制造非线性；
+			* 0xe7037ed1a0b428db 是乘法混合因子；
+			* 0x8ebc6af09c88c6e3 是加法扰动，避免乘法结果落在固定子空间。
+			*/
 			h ^= mix(word + 0xa0761d6478bd642fULL);
 			h = std::rotl(h, 27) * 0xe7037ed1a0b428dbULL + 0x8ebc6af09c88c6e3ULL;
 
@@ -50,7 +57,7 @@ public:
 		if (n != 0) {
 			std::uint64_t tail = 0;
 			std::memcpy(&tail, p, n);
-
+			//wyhash 的 tail 常量,避免长短不同的输入产生相同的哈希
 			h ^= mix(tail ^ (static_cast<std::uint64_t>(n) * 0x589965cc75374cc3ULL));
 		}
 
@@ -59,6 +66,7 @@ public:
 
 private:
 	static constexpr std::uint64_t mix(std::uint64_t x) noexcept {
+		// 俩个splitmix64 的混合常量。进行右移位运算的时候效果最好
 		x ^= x >> 30;
 		x *= 0xbf58476d1ce4e5b9ULL;
 		x ^= x >> 27;
@@ -91,7 +99,7 @@ private:
 			: hash(hash_value), value(value_ptr), key_size(size) {
 		}
 
-		key_view key() const noexcept {
+		[[nodiscard]] key_view key() const noexcept {
 			return {reinterpret_cast<const std::byte *>(this + 1), key_size};
 		}
 
@@ -102,7 +110,7 @@ private:
 
 	struct LookupKey {
 		key_view key;
-		std::uint64_t hash;
+		std::uint64_t hash{};
 	};
 
 	struct NodeHash {
@@ -129,7 +137,7 @@ private:
 		}
 
 	private:
-		static bool equal(std::uint64_t lhs_hash, key_view lhs, std::uint64_t rhs_hash, key_view rhs) noexcept {
+		static bool equal(const std::uint64_t lhs_hash, const key_view lhs, const std::uint64_t rhs_hash, const key_view rhs) noexcept {
 			if (lhs_hash != rhs_hash || lhs.size() != rhs.size()) {
 				return false;
 			}
@@ -351,8 +359,7 @@ private:
 
 		void *memory = pool_.allocate(allocation_size, alignof(Entry));
 
-		Entry *entry =
-			::new(memory) Entry(lookup.hash, value, static_cast<std::uint8_t>(lookup.key.size()));
+		Entry *entry = ::new(memory) Entry(lookup.hash, value, static_cast<std::uint8_t>(lookup.key.size()));
 
 		if (!lookup.key.empty()) {
 			std::memcpy(entry->mutable_key_data(), lookup.key.data(), lookup.key.size());
