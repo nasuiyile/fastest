@@ -4,6 +4,7 @@
   "dependencies": [
     "boost-asio",
     "boost-intrusive",
+    "boost-lockfree",
     "spdlog",
     "catch2",
     {
