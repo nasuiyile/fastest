@@ -82,99 +82,28 @@ private:
 	 *
 	 * 精确读取不会 over-read，因此不会偷走下一条 command。
 	 */
-	class ConnectionBuffer {
+	class ConnectionBuffer : public asio::streambuf {
 	public:
-		std::size_t size() const noexcept { return storage_.size() - offset_; }
-
-		bool empty() const noexcept { return size() == 0; }
-
-		const char *data() const noexcept {
-			if (storage_.empty()) {
-				return nullptr;
-			}
-
-			return storage_.data() + offset_;
-		}
-
-		void append(const char *src, std::size_t n) {
-			if (n == 0) {
-				return;
-			}
-
-			compact_if_needed();
-
-			storage_.insert(storage_.end(), src, src + n);
-		}
-
-		void consume(std::size_t n) {
-			offset_ += n;
-
-			if (offset_ == storage_.size()) {
-				storage_.clear();
-				offset_ = 0;
-				return;
-			}
-
-			compact_if_needed();
-		}
-
-		void copy_out(char *dst, std::size_t n) {
-			if (n == 0) {
-				return;
-			}
-
-			std::memcpy(dst, data(), n);
-
-			consume(n);
-		}
-
+		//在缓存中找到行位
 		std::size_t find_crlf() const noexcept {
-			const std::size_t available = size();
-
-			if (available < 2) {
-				return std::string::npos;
-			}
-
-			const char *p = data();
-
-			for (std::size_t i = 0; i + 1 < available; ++i) {
-				if (p[i] == '\r' && p[i + 1] == '\n') {
-					return i;
+			const auto buffers = data();
+			auto it = asio::buffers_begin(buffers);
+			const auto end = asio::buffers_end(buffers);
+			std::size_t offset = 0;
+			while (it != end) {
+				if (*it == '\r') {
+					auto next = it;
+					++next;
+					if (next != end && *next == '\n') {
+						return offset;
+					}
 				}
+				++it;
+				++offset;
 			}
 
 			return std::string::npos;
 		}
-
-		std::string take_string(std::size_t n) {
-			if (n == 0) {
-				return {};
-			}
-
-			std::string result(data(), n);
-
-			consume(n);
-			return result;
-		}
-
-	private:
-		void compact_if_needed() {
-			if (offset_ == 0) {
-				return;
-			}
-
-			if (offset_ < 4096 && offset_ * 2 < storage_.size()) {
-				return;
-			}
-
-			storage_.erase(storage_.begin(), storage_.begin() + static_cast<std::ptrdiff_t>(offset_));
-
-			offset_ = 0;
-		}
-
-	private:
-		std::vector<char> storage_;
-		std::size_t offset_{0};
 	};
 
 	struct Item {
@@ -204,6 +133,7 @@ private:
 	};
 
 private:
+	//最大读取命令行的限制，命令行是\r\n结尾的
 	static constexpr std::size_t kMaxCommandLineBytes = 8 * 1024;
 	static constexpr std::size_t kMaxValueBytes = 16 * 1024 * 1024;
 	static constexpr std::size_t kMaxKeyBytes = 250;
@@ -223,11 +153,8 @@ private:
 		 * 继续保留。
 		 */
 		ShardRegistry::local_shard = shard_id_;
-
 		asio::co_spawn(io_, mailbox_loop(), asio::detached);
-
 		asio::co_spawn(io_, accept_loop(), asio::detached);
-
 		io_.run();
 	}
 
@@ -300,14 +227,10 @@ private:
 
 	awaitable<void> mailbox_loop() {
 		auto executor = co_await asio::this_coro::executor;
-
 		auto &mailbox = ShardRegistry::inst().mailbox(shard_id_);
-
 		const int wait_fd = mailbox.duplicate_event_fd();
-
 		if (wait_fd < 0) {
 			spdlog::error("[shard {}] failed to dup mailbox eventfd: {}", shard_id_, std::strerror(errno));
-
 			co_return;
 		}
 
@@ -459,9 +382,7 @@ private:
 
 		pending->completed = true;
 
-		boost::system::error_code ignored;
-
-		pending->timer.cancel(ignored);
+		pending->timer.cancel();
 	}
 
 	uint64_t allocate_req_id() noexcept {
@@ -543,22 +464,16 @@ private:
 
 	awaitable<bool> route_set(std::string key, std::string value, uint32_t item_flags) {
 		auto &registry = ShardRegistry::inst();
-
 		const std::size_t target = registry.shard_of(key);
-
 		if (target == shard_id_) {
 			Item item{};
 			item.flags = item_flags;
 			item.value = std::move(value);
-
 			data_.insert_or_assign(std::move(key), std::move(item));
-
 			co_return true;
 		}
-
 		RemoteResult result = co_await request_remote(target, ShardOp::Set, std::move(key), std::move(value),
 		                                              item_flags);
-
 		co_return result.transport_ok && result.status == ShardStatus::Ok;
 	}
 
@@ -611,85 +526,60 @@ private:
 	}
 
 	awaitable<void> accept_loop() {
+		//获取当前协程的executor
 		const auto executor = co_await asio::this_coro::executor;
-
 		boost::system::error_code ec;
-
 		const auto address = asio::ip::make_address(config_.addr, ec);
-
 		if (ec) {
 			spdlog::error("[shard {}] invalid address {}: {}", shard_id_, config_.addr, ec.message());
-
 			co_return;
 		}
-
 		const tcp::endpoint endpoint(address, config_.port);
-
 		tcp::acceptor acceptor(executor);
-
 		acceptor.open(endpoint.protocol(), ec);
-
 		if (ec) {
 			spdlog::error("[shard {}] acceptor open failed: {}", shard_id_, ec.message());
-
 			co_return;
 		}
-
 		acceptor.set_option(asio::socket_base::reuse_address(true), ec);
-
 		if (ec) {
 			spdlog::error("[shard {}] SO_REUSEADDR failed: {}", shard_id_, ec.message());
-
 			co_return;
 		}
-
 #ifdef SO_REUSEPORT
 		int one = 1;
-
 		if (::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0) {
 			spdlog::error("[shard {}] SO_REUSEPORT failed: {}", shard_id_, std::strerror(errno));
-
 			co_return;
 		}
 #endif
-
 		acceptor.bind(endpoint, ec);
-
 		if (ec) {
 			spdlog::error("[shard {}] bind failed: {}", shard_id_, ec.message());
-
 			co_return;
 		}
-
 		acceptor.listen(asio::socket_base::max_listen_connections, ec);
-
 		if (ec) {
 			spdlog::error("[shard {}] listen failed: {}", shard_id_, ec.message());
-
 			co_return;
 		}
-
 		spdlog::info("[shard {}] listening on {}:{}", shard_id_, address.to_string(), config_.port);
-
 		while (!stop_.load(std::memory_order_relaxed)) {
 			tcp::socket socket = co_await acceptor.async_accept(asio::redirect_error(use_awaitable, ec));
-
 			if (ec) {
 				if (ec == asio::error::operation_aborted || stop_.load(std::memory_order_relaxed)) {
 					break;
 				}
-
 				spdlog::warn("[shard {}] accept failed: {}", shard_id_, ec.message());
-
 				continue;
 			}
-
+			//在当前 executor 所属的 io_context 上启动一个协程
 			asio::co_spawn(executor, session(std::move(socket)), asio::detached);
 		}
 	}
 
 	/*
-	 * 只读取 command line。
+	 * 只读取 command line。不会读取memcached中的value
 	 *
 	 * 与 async_read_until 最大的区别是：
 	 *
@@ -698,40 +588,31 @@ private:
 	 * 3. 后续 read_exact() 会首先消费这些数据。
 	 */
 	awaitable<bool> read_command_line(tcp::socket &socket, ConnectionBuffer &input, std::string &line) {
-		std::array<char, kReadChunkBytes> temp{};
-
 		while (true) {
 			const std::size_t crlf = input.find_crlf();
-
 			if (crlf != std::string::npos) {
 				if (crlf > kMaxCommandLineBytes) {
 					co_return false;
 				}
-
-				line.assign(input.data(), crlf);
-
+				line.resize(crlf);
+				if (crlf != 0) {
+					asio::buffer_copy(asio::buffer(line.data(), line.size()), input.data(), crlf);
+				}
 				input.consume(crlf + 2);
-
 				co_return true;
 			}
-
 			const std::size_t max_buffered = kMaxCommandLineBytes + 2;
-
 			if (input.size() >= max_buffered) {
 				co_return false;
 			}
-
 			const std::size_t room = max_buffered - input.size();
-
-			const std::size_t want = std::min(room, temp.size());
-
+			const std::size_t want = std::min(room, kReadChunkBytes);
 			if (want == 0) {
 				co_return false;
 			}
-
-			const std::size_t n = co_await socket.async_read_some(asio::buffer(temp.data(), want), use_awaitable);
-
-			input.append(temp.data(), n);
+			auto buffer = input.prepare(want);
+			const std::size_t n = co_await socket.async_read_some(buffer, use_awaitable);
+			input.commit(n);
 		}
 	}
 
@@ -753,7 +634,9 @@ private:
 		const std::size_t buffered = std::min(input.size(), n);
 
 		if (buffered != 0) {
-			input.copy_out(output, buffered);
+			asio::buffer_copy(asio::buffer(output, buffered), input.data(), buffered);
+
+			input.consume(buffered);
 		}
 
 		const std::size_t remaining = n - buffered;
@@ -765,18 +648,15 @@ private:
 		co_await asio::async_read(socket, asio::buffer(output + buffered, remaining), use_awaitable);
 	}
 
+	//把命令行里的字符串token安全转换为无符号整数。
 	template <typename UInt>
 	static bool parse_unsigned(std::string_view text, UInt &result) {
 		if (text.empty()) {
 			return false;
 		}
-
 		const char *begin = text.data();
-
 		const char *end = text.data() + text.size();
-
 		const auto [p, ec] = std::from_chars(begin, end, result);
-
 		return ec == std::errc{} && p == end;
 	}
 
@@ -810,39 +690,27 @@ private:
 	awaitable<void> session(tcp::socket socket) {
 		try {
 			ConnectionBuffer input;
-
 			while (!stop_.load(std::memory_order_relaxed)) {
 				std::string line;
-
 				const bool valid_line = co_await read_command_line(socket, input, line);
-
 				if (!valid_line) {
 					co_await write_text(socket, "CLIENT_ERROR command line too long\r\n");
-
 					co_return;
 				}
-
 				if (line.empty()) {
 					continue;
 				}
-
 				auto tokens = protocol::split_ws(line);
-
 				if (tokens.empty()) {
 					continue;
 				}
-
 				/*
 				 * 注意：
-				 *
 				 * socket 现在通过引用传给 parse。
-				 *
 				 * 绝对不能再：
-				 *
 				 *   parse(std::move(socket), ...)
 				 */
 				const bool keep_connection = co_await parse(socket, input, std::move(tokens));
-
 				if (!keep_connection) {
 					co_return;
 				}
@@ -861,7 +729,6 @@ private:
 
 	awaitable<bool> parse(tcp::socket &socket, ConnectionBuffer &input, std::vector<std::string_view> tokens) {
 		protocol::MemcachedRequest req;
-
 		req.command = std::string(tokens[0]);
 
 		/*
@@ -870,35 +737,25 @@ private:
 		if (protocol::is_storage_command(req.command)) {
 			if (tokens.size() < 5) {
 				co_await write_text(socket, "ERROR\r\n");
-
 				co_return true;
 			}
 
 			if (!valid_key(tokens[1])) {
 				co_await write_text(socket, "CLIENT_ERROR bad key\r\n");
-
 				co_return true;
 			}
 
 			req.key = std::string(tokens[1]);
-
 			req.flags = std::string(tokens[2]);
-
 			req.exptime = std::string(tokens[3]);
-
 			uint32_t item_flags = 0;
-
 			if (!parse_unsigned(tokens[2], item_flags)) {
 				co_await write_text(socket, "CLIENT_ERROR bad command line format\r\n");
-
 				co_return true;
 			}
-
 			std::size_t bytes = 0;
-
 			if (!parse_unsigned(tokens[4], bytes)) {
 				co_await write_text(socket, "CLIENT_ERROR bad command line format\r\n");
-
 				co_return true;
 			}
 
@@ -913,15 +770,10 @@ private:
 				 */
 				co_return false;
 			}
-
 			req.bytes = bytes;
-
 			req.noreply = tokens.size() >= 6 && tokens[5] == "noreply";
-
 			req.has_value = true;
-
 			req.value.resize(req.bytes);
-
 			/*
 			 * 先消费 ConnectionBuffer 里可能已经预读的 value。
 			 */
