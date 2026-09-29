@@ -12,6 +12,7 @@
 #include <system_error>
 #include <type_traits>
 #include <unistd.h>
+#include <string>
 
 namespace fast_server {
 enum class ShardOp : uint8_t {
@@ -132,19 +133,16 @@ public:
 		if (!message) {
 			return false;
 		}
-
 		ShardEvent ev{};
 		ev.message = message.get();
-
 		if (!queue_.push(ev)) {
 			return false;
 		}
-
 		/*
 		 * queue 已经拥有 message。
 		 */
 		message.release();
-
+		//确保notify是在push完成后才发生，不会撞上半完成的pusd
 		notify();
 		return true;
 	}
@@ -230,6 +228,7 @@ private:
 			if (n == static_cast<ssize_t>(sizeof(one))) {
 				return;
 			}
+			// errno自动保存最近一次系统调用哦失败的原因
 			if (n < 0 && errno == EINTR) {
 				continue;
 			}
