@@ -233,20 +233,16 @@ private:
 			spdlog::error("[shard {}] failed to dup mailbox eventfd: {}", shard_id_, std::strerror(errno));
 			co_return;
 		}
-
 		/*
 		 * stream_descriptor 只拥有 duplicate fd。
 		 *
 		 * Mailbox 仍然拥有原始 eventfd。
 		 */
 		asio::posix::stream_descriptor descriptor(executor, wait_fd);
-
 		while (!stop_.load(std::memory_order_relaxed)) {
 			boost::system::error_code ec;
-
 			co_await descriptor.async_wait(asio::posix::stream_descriptor::wait_read,
 			                               asio::redirect_error(use_awaitable, ec));
-
 			if (ec) {
 				if (ec != asio::error::operation_aborted && !stop_.load(std::memory_order_relaxed)) {
 					spdlog::error("[shard {}] mailbox wait failed: {}", shard_id_, ec.message());
@@ -254,11 +250,9 @@ private:
 
 				break;
 			}
-
 			mailbox.clear_notify();
-
 			std::unique_ptr<ShardMessage> message;
-
+			// 一次可以消费掉多个元素
 			while (mailbox.pop(message)) {
 				try {
 					handle_shard_message(std::move(message));
