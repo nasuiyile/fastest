@@ -29,6 +29,7 @@ public:
 
 	static thread_local size_t local_shard;
 
+
 private:
 	ShardRegistry() = default;
 

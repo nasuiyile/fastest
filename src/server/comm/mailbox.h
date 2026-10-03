@@ -1,9 +1,7 @@
 #pragma once
-
 #include <boost/lockfree/mpsc_weak_queue.hpp>
 
 #include <sys/eventfd.h>
-
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -14,145 +12,76 @@
 #include <unistd.h>
 #include <string>
 
-namespace fast_server {
-enum class ShardOp : uint8_t {
-	Get,
-	Set,
-	Del
-};
-
-enum class ShardMessageType : uint8_t {
-	Request,
-	Response
-};
-
-enum class ShardStatus : uint8_t {
-	Ok,
-	NotFound,
-	Error
-};
-
-/*
- * 真正的数据放在堆上的 ShardMessage 中。
- *
- * lock-free queue 里只传一个指针，因此 ShardEvent 本身保持
- * trivially-copyable。
- *
- * ownership:
- *
- *   producer:
- *       unique_ptr<ShardMessage>
- *
- *   Mailbox::try_push() 成功:
- *       ownership -> mailbox queue
- *
- *   Mailbox::pop():
- *       ownership -> consumer unique_ptr
- */
-struct ShardMessage {
-	ShardMessageType type{ShardMessageType::Request};
-	ShardOp op{ShardOp::Get};
-	ShardStatus status{ShardStatus::Error};
-
-	uint64_t req_id{0};
-	uint64_t origin_shard{0};
-
-	uint32_t item_flags{0};
-
-	std::string key;
-	std::string value;
-};
-
+// 事件只持有指向消息的指针，因此与消息类型无关存储布局
+template <typename Message>
 struct ShardEvent {
-	ShardMessage *message{nullptr};
+	Message *message{nullptr};
 };
 
-static_assert(std::is_trivially_copyable_v<ShardEvent>);
+// constexpr std::size_t kMailboxCapacity = 4096;
 
-constexpr std::size_t kMailboxCapacity = 4096;
+namespace comm {
+template <typename Message>
+class alignas(64) Mailbox {
+	static_assert(std::is_trivially_copyable_v<ShardEvent<Message> >, "ShardEvent must be trivially copyable");
+	// using MailboxQueue = boost::lockfree::mpsc_weak_queue
+	// <ShardEvent<Message>, boost::lockfree::capacity<kMailboxCapacity> >;
+	using MailboxQueue = boost::lockfree::mpsc_weak_queue<ShardEvent<Message> >;
 
-using MailboxQueue =
-boost::lockfree::mpsc_weak_queue<
-	ShardEvent,
-	boost::lockfree::capacity<kMailboxCapacity>
->;
-
-struct alignas(64) Mailbox {
 public:
 	Mailbox() {
 		event_fd_ = ::eventfd(0,EFD_NONBLOCK | EFD_CLOEXEC);
 		if (event_fd_ < 0) {
-			throw std::system_error(
-				errno,
-				std::generic_category(),
-				"eventfd"
-				);
+			throw std::system_error(errno, std::generic_category(), "eventfd");
 		}
 	}
 
 	~Mailbox() {
 		/*
-		 * 正常 shutdown 顺序应该是：
-		 *
-		 *   request_stop workers
-		 *   join workers
-		 *   destroy ShardRegistry / Mailbox
-		 *
 		 * 这里仍然把残留消息释放掉，避免 shutdown 时泄漏。
 		 */
-		ShardEvent ev{};
-
+		ShardEvent<Message> ev{};
 		while (queue_.pop(ev)) {
 			delete ev.message;
 			ev.message = nullptr;
 		}
-
 		if (event_fd_ >= 0) {
 			::close(event_fd_);
 			event_fd_ = -1;
 		}
 	}
 
+
+	// 禁止拷贝
 	Mailbox(const Mailbox &) = delete;
 
 	Mailbox &operator=(const Mailbox &) = delete;
 
-	/*
-	 * 非阻塞 push。
-	 *
-	 * 重点：这里绝对不能在 shard event-loop 线程里面无限自旋。
-	 *
-	 * 如果 queue 满，直接返回 false。
-	 * Worker 会通过 coroutine timer 做退避重试。
-	 */
-	bool try_push(std::unique_ptr<ShardMessage> &message) {
+	bool try_push(std::unique_ptr<Message> &message) {
 		if (!message) {
 			return false;
 		}
-		ShardEvent ev{};
+		ShardEvent<Message> ev{};
 		ev.message = message.get();
 		if (!queue_.push(ev)) {
 			return false;
 		}
-		/*
-		 * queue 已经拥有 message。
-		 */
+		// queue 已经拥有 message。释放对message的所有权 防止delete
 		message.release();
 		//确保notify是在push完成后才发生，不会撞上半完成的pusd
 		notify();
 		return true;
 	}
 
+
 	/*
 	 * consumer 取得 ownership。
 	 */
-	bool pop(std::unique_ptr<ShardMessage> &out) {
-		ShardEvent ev{};
-
+	bool pop(std::unique_ptr<Message> &out) {
+		ShardEvent<Message> ev{};
 		if (!queue_.pop(ev)) {
 			return false;
 		}
-
 		out.reset(ev.message);
 		return true;
 	}
@@ -168,29 +97,19 @@ public:
 	 */
 	int duplicate_event_fd() const noexcept {
 #ifdef F_DUPFD_CLOEXEC
-		return ::fcntl(
-			event_fd_,
-			F_DUPFD_CLOEXEC,
-			0
-			);
+		return ::fcntl(event_fd_,F_DUPFD_CLOEXEC, 0);
 #else
 		const int fd = ::dup(event_fd_);
-
 		if (fd >= 0) {
 			const int flags = ::fcntl(fd, F_GETFD);
-
 			if (flags >= 0) {
-				::fcntl(
-					fd,
-					F_SETFD,
-					flags | FD_CLOEXEC
-					);
+				::fcntl(fd,F_SETFD,flags | FD_CLOEXEC);
 			}
 		}
-
 		return fd;
 #endif
 	}
+
 
 	/*
 	 * eventfd 非 semaphore 模式下，一次 read 会读取整个 counter，并把 counter 清零。
@@ -224,7 +143,7 @@ private:
 			if (n == static_cast<ssize_t>(sizeof(one))) {
 				return;
 			}
-			// errno自动保存最近一次系统调用哦失败的原因
+			// errno自动保存最近一次系统调用失败的原因
 			if (n < 0 && errno == EINTR) {
 				continue;
 			}
@@ -238,8 +157,7 @@ private:
 		}
 	}
 
-private:
 	MailboxQueue queue_;
 	int event_fd_{-1};
 };
-} // namespace fast_server
+} // namespace comm

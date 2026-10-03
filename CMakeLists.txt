@@ -29,6 +29,12 @@ add_executable(fastest
         src/server/mailbox.h
         src/server/shard_registry.h
         src/server/worker.h
+        src/server/comm/ring_array.h
+        "src/server/comm/mailbox.h"
+        src/server/comm/worker.h
+        src/server/comm/shard.h
+        src/server/comm/shard.h
+        src/util/hash.h
 )
 
 target_link_libraries(fastest

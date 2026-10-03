@@ -10,17 +10,17 @@
 #include <spdlog/spdlog.h>
 
 namespace fast_server {
-
 class FastestServer {
 public:
-	explicit FastestServer(const Config cfg) : config_(cfg) {}
+	explicit FastestServer(const Config cfg) : config_(cfg) {
+	}
 
 	// ============================================================
 	//                     完整的 start()
 	// ============================================================
 	void start() {
 		// 1. 分片数 = CPU 核数
-		const unsigned int thread_count = core_num();
+		const unsigned int thread_count = util::core_num();
 		spdlog::info("FastestServer starting with {} worker threads", thread_count);
 
 		// 2. 初始化 ShardRegistry（N 个 mailbox，每个自带 eventfd）
@@ -48,7 +48,7 @@ public:
 		spdlog::info("All {} workers started. Press Ctrl+C to stop.", thread_count);
 
 		// 6. 等待所有 worker 退出（stop() 会通过 eventfd/io_.stop() 唤醒它们）
-		for (auto& w : workers_) {
+		for (auto &w : workers_) {
 			w->join();
 		}
 
@@ -57,14 +57,13 @@ public:
 
 	// 优雅停止（可从信号处理器调用）
 	void stop() {
-		for (auto& w : workers_) {
+		for (auto &w : workers_) {
 			w->request_stop();
 		}
 	}
 
 private:
 	Config config_;
-	std::vector<std::unique_ptr<Worker>> workers_;
+	std::vector<std::unique_ptr<Worker> > workers_;
 };
-
 } // namespace fast_server
