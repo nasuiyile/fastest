@@ -2,10 +2,6 @@
 #include "mailbox.h"
 #include <vector>
 #include <memory>
-#include <string_view>
-#include <functional>
-
-#include "../../util/hardware_info.h"
 #include "../../util/hash.h"
 
 namespace comm {
@@ -31,6 +27,10 @@ public:
 		return *mailboxes_[id];
 	}
 
+	SharedSystem(const SharedSystem &) = delete;
+
+	SharedSystem &operator=(const SharedSystem &) = delete;
+
 private:
 	std::vector<std::unique_ptr<Mailbox<Message> > > mailboxes_{};
 };
@@ -38,7 +38,7 @@ private:
 template <typename Request, typename Response>
 class ShardComm {
 public:
-	std::vector<ShardComm> ShardCommList(const std::size_t num) {
+	static std::vector<ShardComm> create_shard_comm(const std::size_t num) {
 		std::vector<ShardComm> vec;
 		auto request_mailbox = std::make_shared<SharedSystem<Request> >(num);
 		auto response_mailbox = std::make_shared<SharedSystem<Response> >(num);
@@ -48,13 +48,21 @@ public:
 		return vec;
 	}
 
-	[[nodiscard]] bool current_shard() const {
+	[[nodiscard]] std::size_t current_shard() const {
 		return shard_id_;
 	}
 
 	[[nodiscard]] bool is_current_shard(const std::size_t hash) const {
 		return get_shard(hash) == shard_id_;
 	}
+
+	ShardComm(const ShardComm &) = delete;
+
+	ShardComm &operator=(const ShardComm &) = delete;
+
+	ShardComm(ShardComm &&) noexcept = default;
+
+	ShardComm &operator=(ShardComm &&) noexcept = default;
 
 private:
 	[[nodiscard]] std::size_t get_shard(const uint64_t hash) const {

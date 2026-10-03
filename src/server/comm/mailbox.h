@@ -29,7 +29,7 @@ class alignas(64) Mailbox {
 	using MailboxQueue = boost::lockfree::mpsc_weak_queue<ShardEvent<Message> >;
 
 public:
-	Mailbox() {
+	Mailbox() : queue_(1024){
 		event_fd_ = ::eventfd(0,EFD_NONBLOCK | EFD_CLOEXEC);
 		if (event_fd_ < 0) {
 			throw std::system_error(errno, std::generic_category(), "eventfd");

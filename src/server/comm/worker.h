@@ -1,26 +1,9 @@
 #pragma once
 
-#include "mailbox.h"
-
-
+#include "../../util/hardware_info.h"
 #include <boost/asio.hpp>
-#include <boost/asio/posix/stream_descriptor.hpp>
-#include <spdlog/spdlog.h>
-#include <sys/socket.h>
-
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <charconv>
-#include <chrono>
-#include <cstdint>
 #include <cstring>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <thread>
-#include <unordered_map>
-#include <utility>
+
 #include <vector>
 
 #include "shard.h"
@@ -32,6 +15,7 @@ using asio::awaitable;
 using asio::ip::tcp;
 using asio::use_awaitable;
 
+
 // 负责抽象发送数据 和响应回调，每个线程都持有这样一个worker，并且可以通过worker和其他线程的mailbox来进行通信
 
 struct RequestMessage {
@@ -42,12 +26,23 @@ struct ResponseMessage {
 
 class Worker {
 public:
+	using Sc = ShardComm<RequestMessage, ResponseMessage>;
 
+	static std::vector<Worker> create_workers() {
+		const std::size_t core_num = util::core_num();
+		std::vector<Sc> shard_comm = Sc::create_shard_comm(core_num);
+		std::vector<Worker> workers;
+		workers.reserve(core_num);
+		for (Sc &comm : shard_comm) {
+			workers.push_back(Worker(std::move(comm)));
+		}
+		return workers;
+	}
 
 private:
-	explicit Worker(const ShardComm<RequestMessage, ResponseMessage> &shard_comm)
-	: shard_comm_(shard_comm) {
+	explicit Worker(ShardComm<RequestMessage, ResponseMessage> shard_comm): shard_comm_(std::move(shard_comm)) {
 	}
-	ShardComm<RequestMessage, ResponseMessage> shard_comm_;
+
+	Sc shard_comm_;
 };
 }
