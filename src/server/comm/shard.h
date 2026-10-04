@@ -2,9 +2,14 @@
 #include "mailbox.h"
 #include <vector>
 #include <memory>
+#include <boost/asio.hpp>
+
 #include "../../util/hash.h"
 
 namespace comm {
+namespace asio = boost::asio;
+using asio::awaitable;
+
 template <typename Message>
 class SharedSystem {
 public:
@@ -19,13 +24,11 @@ public:
 		return mailboxes_.size();
 	}
 
-	[[nodiscard]] std::size_t shard_of(uint64_t hash) const noexcept {
-		return hash % mailboxes_.size();
-	}
 
 	Mailbox<Message> &mailbox(std::size_t id) noexcept {
 		return *mailboxes_[id];
 	}
+
 
 	SharedSystem(const SharedSystem &) = delete;
 
@@ -33,6 +36,7 @@ public:
 
 private:
 	std::vector<std::unique_ptr<Mailbox<Message> > > mailboxes_{};
+	int event_fd_{-1};
 };
 
 template <typename Request, typename Response>
@@ -48,13 +52,40 @@ public:
 		return vec;
 	}
 
-	[[nodiscard]] std::size_t current_shard() const {
+	[[nodiscard]] inline Mailbox<Request> &current_request_mailbox() const {
+		return request_mailbox->mailbox(shard_id_);
+	}
+
+	[[nodiscard]] inline Mailbox<Response> &current_response_mailbox() const {
+		return response_mailbox->mailbox(shard_id_);
+	}
+
+	[[nodiscard]] std::size_t current_shard_id() const {
 		return shard_id_;
 	}
 
 	[[nodiscard]] bool is_current_shard(const std::size_t hash) const {
 		return get_shard(hash) == shard_id_;
 	}
+
+	awaitable<bool> send_request_to_shard(const uint64_t hash, std::unique_ptr<Request> message) {
+		std::size_t shard_id = get_shard(hash);
+		Mailbox<Request> &mailbox = request_mailbox->mailbox(shard_id);
+		if (mailbox.try_push(message)) {
+			co_return true;
+		}
+		co_return false;
+	}
+
+	awaitable<bool> send_response_shard(const uint64_t hash, std::unique_ptr<Response> message) {
+		std::size_t shard_id = get_shard(hash);
+		Mailbox<Response> &mailbox = response_mailbox->mailbox(shard_id);
+		if (mailbox.try_push(message)) {
+			co_return true;
+		}
+		co_return false;
+	}
+
 
 	ShardComm(const ShardComm &) = delete;
 
@@ -65,7 +96,7 @@ public:
 	ShardComm &operator=(ShardComm &&) noexcept = default;
 
 private:
-	[[nodiscard]] std::size_t get_shard(const uint64_t hash) const {
+	[[nodiscard]] inline std::size_t get_shard(const uint64_t hash) const {
 		return util::get_shard(hash, shard_num_);
 	}
 
@@ -77,7 +108,9 @@ private:
 		  response_mailbox(std::move(response_mailbox)) {
 	}
 
+
 	std::size_t shard_id_ = 0;
+	//分片总数
 	std::size_t shard_num_ = 0;
 	std::shared_ptr<SharedSystem<Request> > request_mailbox;
 	std::shared_ptr<SharedSystem<Response> > response_mailbox;

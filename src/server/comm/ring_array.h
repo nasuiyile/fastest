@@ -1,8 +1,12 @@
 #pragma once
 
+#include <bit>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -10,70 +14,71 @@ namespace comm {
 template <typename T>
 concept HasSeq = requires(const T &s)
 {
-	{ s.seq } -> std::convertible_to<uint64_t>;
+	requires std::same_as<std::remove_cvref_t<decltype(s.seq)>, uint32_t>;
 };
 
 template <HasSeq Slot>
 class RingArray {
+	static_assert(std::is_nothrow_move_constructible_v<Slot>, "Slot must be nothrow move-constructible");
+
 public:
-	explicit RingArray(std::size_t initial_capacity = 32)
-		: ring_(initial_capacity) {
+	explicit RingArray(std::size_t initial_capacity = 32) {
+		if (initial_capacity == 0 || initial_capacity > kHalfRange) {
+			throw std::invalid_argument("RingArray capacity must be in [1, 2^31]");
+		}
+		// 容量向上取 2 的幂，保证 seq % capacity 在回绕时仍然正确。
+		ring_.resize(std::bit_ceil(initial_capacity));
 	}
 
-	void append(uint64_t index, Slot slot) {
-		// 正常情况下不应该收到已经发送过的响应
-		if (index < next_id_) {
+	void append(uint32_t index, Slot slot) {
+		const uint32_t distance = static_cast<uint32_t>(index - next_id_);
+		// 丢弃窗口外响应，包括旧序号和恰好相差半圈的歧义情况。
+		if (distance >= kHalfRange) {
 			return;
 		}
+		if (slot.seq != index) {
+			throw std::invalid_argument("RingArray index does not match slot.seq");
+		}
 		ensure_capacity(index);
-		const auto pos = index % ring_.size();
-		// 理论上这里不应该覆盖另一个有效请求
-		// 如果发生，说明窗口/seq管理有bug
-		ring_[pos] = std::move(slot);
+		auto &value = ring_[index % ring_.size()];
+		if (value) {
+			if (value->seq == index) {
+				return; // 重复响应：保留首次写入的数据。
+			}
+			throw std::logic_error("RingArray slot collision");
+		}
+		value.emplace(std::move(slot));
 	}
 
-	//根据id获取
 	[[nodiscard]]
-	Slot *get(uint64_t index) {
-		if (index < next_id_) {
+	Slot *get(uint32_t index) noexcept {
+		const auto distance = static_cast<uint32_t>(index - next_id_);
+		if (distance >= kHalfRange || distance >= ring_.size()) {
 			return nullptr;
 		}
 		auto &value = ring_[index % ring_.size()];
-		if (!value) {
-			return nullptr;
-		}
-		// 防止不同 seq 因 modulo 落到同一槽位
-		if (static_cast<uint64_t>(value->seq) != index) {
+		if (!value || value->seq != index) {
 			return nullptr;
 		}
 		return &*value;
 	}
 
-	/*
-	 * 获取当前可以发送的响应。
-	 *
-	 * 调用者发送完成之后调用 pop_front()。
-	 */
+	// 扩容会使返回的指针失效，不要跨可能发生扩容的 co_await 持有。
 	[[nodiscard]]
-	Slot *front() {
-		auto &value = ring_[next_id_ % ring_.size()];
-		if (!value) {
-			return nullptr;
-		}
-		if (static_cast<uint64_t>(value->seq) != next_id_) {
-			return nullptr;
-		}
-		return &*value;
+	Slot *front() noexcept {
+		return get(next_id_);
 	}
 
-	void pop_front() {
-		auto &value = ring_[next_id_ % ring_.size()];
-		value.reset();
+	void pop_front() noexcept {
+		if (!front()) {
+			return;
+		}
+		ring_[next_id_ % ring_.size()].reset();
 		++next_id_;
 	}
 
 	[[nodiscard]]
-	uint64_t next_id() const noexcept {
+	uint32_t next_id() const noexcept {
 		return next_id_;
 	}
 
@@ -83,14 +88,13 @@ public:
 	}
 
 private:
-	void ensure_capacity(uint64_t index) {
-		const uint64_t distance = index - next_id_;
+	void ensure_capacity(uint32_t index) {
+		const uint32_t distance = static_cast<uint32_t>(index - next_id_);
 		if (distance < ring_.size()) {
 			return;
 		}
 		std::size_t new_capacity = ring_.size();
-		// 不能只扩一次。
-		// 例如 capacity=32，但突然收到 seq=1000。
+		// append() 已保证 distance < 2^31，扩容最多到 2^31。
 		while (distance >= new_capacity) {
 			new_capacity *= 2;
 		}
@@ -99,17 +103,15 @@ private:
 			if (!value) {
 				continue;
 			}
-			const uint64_t seq = static_cast<uint64_t>(value->seq);
-			// 注意这里必须 % 新容量
-			const auto new_pos = seq % new_capacity;
-			new_ring[new_pos] = std::move(value);
+			const auto new_pos = value->seq % new_capacity;
+			new_ring[new_pos].emplace(std::move(*value));
 		}
 		ring_ = std::move(new_ring);
 	}
 
 private:
-	uint64_t next_id_ = 0;
-
+	static constexpr uint32_t kHalfRange = uint32_t{1} << 31;
+	uint32_t next_id_ = 0;
 	std::vector<std::optional<Slot> > ring_;
 };
-} // namespace fast_server
+} // namespace comm
