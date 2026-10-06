@@ -35,6 +35,8 @@ add_executable(fastest
         src/server/comm/shard.h
         src/server/comm/shard.h
         src/util/hash.h
+        src/server/comm/handler.h
+        src/server/comm/type.h
 )
 
 target_link_libraries(fastest

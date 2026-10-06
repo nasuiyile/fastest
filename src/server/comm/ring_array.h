@@ -30,25 +30,28 @@ public:
 		ring_.resize(std::bit_ceil(initial_capacity));
 	}
 
-	void append(uint32_t index, Slot slot) {
-		const uint32_t distance = static_cast<uint32_t>(index - next_id_);
-		// 丢弃窗口外响应，包括旧序号和恰好相差半圈的歧义情况。
+	// 返回值表示：调用结束后，next_id_ 对应的响应是否已经就绪。
+	// [[nodiscard]]
+	bool append(Slot slot) {
+		const uint32_t seq = slot.seq;
+		const uint32_t distance = static_cast<uint32_t>(seq - next_id_);
+		// 丢弃旧响应或半圈歧义响应，返回当前队首的就绪状态。
 		if (distance >= kHalfRange) {
-			return;
+			return front() != nullptr;
 		}
-		if (slot.seq != index) {
-			throw std::invalid_argument("RingArray index does not match slot.seq");
-		}
-		ensure_capacity(index);
-		auto &value = ring_[index % ring_.size()];
+		ensure_capacity(seq);
+		auto& value = ring_[seq % ring_.size()];
 		if (value) {
-			if (value->seq == index) {
-				return; // 重复响应：保留首次写入的数据。
+			if (value->seq == seq) {
+				// 重复响应：保留首次写入的数据。
+				return front() != nullptr;
 			}
 			throw std::logic_error("RingArray slot collision");
 		}
 		value.emplace(std::move(slot));
+		return front() != nullptr;
 	}
+
 
 	[[nodiscard]]
 	Slot *get(uint32_t index) noexcept {
@@ -85,6 +88,38 @@ public:
 	[[nodiscard]]
 	std::size_t capacity() const noexcept {
 		return ring_.size();
+	}
+
+	// 当前需要按序发送的响应是否已经就绪。
+	// 只检查 next_id_ 对应的元素，不跳过缺失的响应。
+	[[nodiscard]]
+	bool is_ready() const noexcept {
+		const auto &value = ring_[next_id_ % ring_.size()];
+		return value.has_value() && value->seq == next_id_;
+	}
+
+	// 尝试取出并删除 next_id_ 对应的元素。
+	// 成功：返回元素，清空原槽位，并推进 next_id_。
+	// 失败：返回 std::nullopt，不改变状态。
+	[[nodiscard]]
+	std::optional<Slot> try_pop() noexcept {
+		auto &value = ring_[next_id_ % ring_.size()];
+
+		if (!value || value->seq != next_id_) {
+			return std::nullopt;
+		}
+
+		// 先将元素移动到返回值中。
+		std::optional<Slot> result(
+			std::in_place,
+			std::move(*value)
+		);
+
+		// 移动后直接清空已定位的槽位，不再检查原元素的 seq。
+		value.reset();
+		++next_id_;
+
+		return result;
 	}
 
 private:
