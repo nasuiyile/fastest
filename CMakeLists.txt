@@ -37,6 +37,7 @@ add_executable(fastest
         src/util/hash.h
         src/server/comm/handler.h
         src/server/comm/type.h
+        src/server/comm/config.h
 )
 
 target_link_libraries(fastest
