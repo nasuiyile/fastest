@@ -9,6 +9,7 @@
 #include "ring_array.h"
 #include "shard.h"
 #include "type.h"
+#include "../../protocol/memcached_parser.h"
 
 namespace comm {
 namespace asio = boost::asio;
@@ -20,9 +21,11 @@ using asio::ip::tcp;
 class Worker {
 public:
 	using Sc = ShardComm<RequestMessage, ResponseMessage>;
+
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
-	    : stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
+		: stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
 	}
+
 	static std::vector<Worker> create_workers(std::size_t core_num, const std::shared_ptr<std::atomic_bool> &stop) {
 		std::vector<Sc> shard_comm = Sc::create_shard_comm(core_num);
 		// 所有 Worker 共享同一个 stop
@@ -34,16 +37,20 @@ public:
 		return workers;
 	}
 
-	awaitable<bool> set(Key k, const Item &item, const uint32_t tcp_fd) {
-		const ItemKey key(std::move(k));
-		if (is_current_shard(key.hash)) {
-			data_.emplace(key, item);
-		} else {
-			SetCommand request_data = {.key = key, .value = item};
-			RequestData request {.command = SetCommand {std::move(request_data)}};
-			co_await send_request_to_shard(RequestData(std::move(request_data)), tcp_fd);
-		}
+	void do_operation(protocol::Command command, const uint32_t tcp_fd) {
 	}
+
+	// awaitable<bool> set(Key k, const Item &item, const uint32_t tcp_fd) {
+	// 	const ItemKey key(std::move(k));
+	// 	if (is_current_shard(key.hash)) {
+	// 		data_.emplace(key, item);
+	// 	} else {
+	// 		SetCommand request_data = {.key = key, .value = item};
+	// 		RequestData request{.command = SetCommand{std::move(request_data)}};
+	// 		co_await send_request_to_shard(RequestData(std::move(request_data)), tcp_fd);
+	// 	}
+	// }
+
 	// 接收他人请求
 	awaitable<void> mailbox_request_loop() {
 		std::size_t shard_id = shard_comm_.current_shard_id();
@@ -117,6 +124,7 @@ public:
 			}
 		}
 	}
+
 	[[nodiscard]] std::size_t current_shard_id() const {
 		return shard_comm_.current_shard_id();
 	}
@@ -128,8 +136,8 @@ private:
 
 	awaitable<void> handle_set(const SetCommand &c, const std::unique_ptr<RequestMessage> &message) {
 		data_.emplace(c.key, c.value);
-		ResponseMessage response {
-		    .tcp_fd = message->tcp_fd, .seq = message->seq, .data = ResponseData {.command = {SetResponse {}}}};
+		ResponseMessage response{
+			.tcp_fd = message->tcp_fd, .seq = message->seq, .data = ResponseData{.command = {SetResponse{}}}};
 		co_await shard_comm_.send_response_shard(c.key.hash, std::make_unique<ResponseMessage>(response));
 	}
 
@@ -141,16 +149,17 @@ private:
 	awaitable<bool> handle_request_message(std::unique_ptr<RequestMessage> message) {
 		auto &cmd = message->data.command;
 		co_await std::visit(
-		    [&, this](const auto &c) -> awaitable<void> {
-			    using T = std::decay_t<decltype(c)>;
-			    if constexpr (std::is_same_v<T, SetCommand>)
-				    co_await handle_set(c, message);
-			    else if constexpr (std::is_same_v<T, GetCommand>)
-				    co_await handle_get(c, message);
-		    },
-		    cmd);
+			[&, this](const auto &c) -> awaitable<void> {
+				using T = std::decay_t<decltype(c)>;
+				if constexpr (std::is_same_v<T, SetCommand>)
+					co_await handle_set(c, message);
+				else if constexpr (std::is_same_v<T, GetCommand>)
+					co_await handle_get(c, message);
+			},
+			cmd);
 		co_return true;
 	}
+
 	void handle_response_message(std::unique_ptr<ResponseMessage> message) {
 		// 写到环形数组中。如果满足回复client的条件，获得对应的TCP socket，写入TCP socket。
 		ring_array_.append(*message);
@@ -165,17 +174,17 @@ private:
 		}
 	}
 
-	awaitable<bool> send_request_to_shard(const RequestData &request_data, const uint32_t tcp_fd) {
-		const uint64_t hash = request_data.command.hash();
-		RequestMessage request_message = {.tcp_fd = tcp_fd,
-		                                  .seq = seq_++,
-		                                  .origin_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-		                                  .data = (request_data)};
-		return shard_comm_.send_request_to_shard(hash, std::make_unique<RequestMessage>(std::move(request_message)));
-	}
+	// awaitable<bool> send_request_to_shard(const RequestData &request_data, const uint32_t tcp_fd) {
+	// 	const uint64_t hash = request_data.command.hash();
+	// 	RequestMessage request_message = {.tcp_fd = tcp_fd,
+	// 	                                  .seq = seq_++,
+	// 	                                  .origin_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+	// 	                                  .data = (request_data)};
+	// 	return shard_comm_.send_request_to_shard(hash, std::make_unique<RequestMessage>(std::move(request_message)));
+	// }
 
 	std::unordered_map<ItemKey, Item, KeyHash, KeyEqual> data_;
-	uint32_t seq_ {0};
+	uint32_t seq_{0};
 	RingArray<ResponseMessage> ring_array_;
 	std::shared_ptr<std::atomic_bool> stop_;
 	Sc shard_comm_;

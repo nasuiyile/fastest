@@ -38,6 +38,7 @@ add_executable(fastest
         src/server/comm/handler.h
         src/server/comm/type.h
         src/server/comm/config.h
+        src/protocol/memcached_parser.h
 )
 
 target_link_libraries(fastest

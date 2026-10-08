@@ -10,9 +10,10 @@
 #include <atomic>
 
 #include "worker.h"
-#include "../../protocol/memcahed_request.h"
+#include "../../protocol/memcached_parser.h"
 #include "type.h"
 #include <sys/socket.h>
+
 namespace comm {
 using asio::awaitable;
 using asio::use_awaitable;
@@ -24,18 +25,19 @@ public:
 		thread_ = std::thread([this] { run(); });
 	}
 
-	static std::vector<std::unique_ptr<Handler>> create_handlers(const Config &cfg) {
+	static std::vector<std::unique_ptr<Handler> > create_handlers(const Config &cfg) {
 		const std::size_t core_num = util::core_num();
 		auto stop = std::make_shared<std::atomic_bool>(false);
 		auto workers = Worker::create_workers(core_num, stop);
-		std::vector<std::unique_ptr<Handler>> handlers;
+		std::vector<std::unique_ptr<Handler> > handlers;
 		handlers.reserve(workers.size());
 		for (auto &worker : workers) {
 			handlers.push_back(
-			    std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
+				std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
 		}
 		return handlers;
 	}
+
 	void join() {
 		if (thread_.joinable()) {
 			thread_.join();
@@ -44,95 +46,72 @@ public:
 
 private:
 	explicit Handler(Config config, std::unique_ptr<Worker> worker, std::shared_ptr<std::atomic_bool> stop)
-	    : config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
+		: config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
 	}
+
 	// 最大读取命令行的限制，命令行是\r\n结尾的
 	static constexpr std::size_t kMaxCommandLineBytes = 8 * 1024;
 	// 单次最多读取字节数
 	static constexpr std::size_t kReadChunkBytes = 4096;
 
-	class ConnectionBuffer : public asio::streambuf {
-	public:
-		// 在缓存中找到行位
-		[[nodiscard]] std::size_t find_crlf() const noexcept {
-			const auto buffers = data();
-			auto it = asio::buffers_begin(buffers);
-			const auto end = asio::buffers_end(buffers);
-			std::size_t offset = 0;
-			while (it != end) {
-				if (*it == '\r') {
-					auto next = it;
-					++next;
-					if (next != end && *next == '\n') {
-						return offset;
-					}
-				}
-				++it;
-				++offset;
-			}
-
-			return std::string::npos;
-		}
-	};
-
-	// 多读到的 value 数据仍然保存在 ConnectionBuffer 中。 后续 read_exact() 会首先消费这些数据。
-
-	static awaitable<bool> read_command_line(tcp::socket &socket, ConnectionBuffer &input, std::string &line) {
-		while (true) {
-			const std::size_t crlf = input.find_crlf();
-			if (crlf != std::string::npos) {
-				if (crlf > kMaxCommandLineBytes) {
-					co_return false;
-				}
-				line.resize(crlf);
-				if (crlf != 0) {
-					asio::buffer_copy(asio::buffer(line.data(), line.size()), input.data(), crlf);
-				}
-				input.consume(crlf + 2);
-				co_return true;
-			}
-			constexpr std::size_t max_buffered = kMaxCommandLineBytes + 2;
-			if (input.size() >= max_buffered) {
-				co_return false;
-			}
-			const std::size_t room = max_buffered - input.size();
-			const std::size_t want = std::min(room, kReadChunkBytes);
-			if (want == 0) {
-				co_return false;
-			}
-			auto buffer = input.prepare(want);
-			// 至少读一个字节，如果缓冲区里有足够的数据，最多读4096
-			const std::size_t n = co_await socket.async_read_some(buffer, use_awaitable);
-			input.commit(n);
-		}
-	}
 	static awaitable<void> write_text(tcp::socket &socket, const std::string_view text) {
 		co_await asio::async_write(socket, asio::buffer(text.data(), text.size()), use_awaitable);
 	}
 
+	static std::string_view parse_error_message(protocol::ParseErrorCode code) noexcept {
+		using enum protocol::ParseErrorCode;
+		switch (code) {
+		case UnknownCommand:
+			return "ERROR\r\n";
+		case InvalidKey:
+			return "CLIENT_ERROR bad key\r\n";
+		case ValueTooLarge:
+			return "SERVER_ERROR object too large\r\n";
+		case BadDataChunk:
+			return "CLIENT_ERROR bad data chunk\r\n";
+		case CommandLineTooLong:
+			return "CLIENT_ERROR command line too long\r\n";
+		default:
+			return "CLIENT_ERROR bad command line format\r\n";
+		}
+	}
+
+	static awaitable<bool> handle_parse_error(tcp::socket &socket, const protocol::ParseError &error) {
+		co_await write_text(socket, parse_error_message(error.code));
+		co_return error.recovery == protocol::ErrorRecovery::Continue;
+	}
+
+	static awaitable<void> execute_batch(const std::vector<protocol::Command> &vector) {
+
+	};
+
 	awaitable<void> session(tcp::socket socket) const {
 		std::size_t shard_id = worker_->current_shard_id();
 		try {
-			ConnectionBuffer input;
-			std::string line;
-			line.reserve(256);
+			protocol::MemcachedParser parser;
+			//保留上一次没有解析完的数据
+			std::string input;
+			std::array<char, 4096> recv_buffer{};
 			while (!stop_->load(std::memory_order_relaxed)) {
-				const bool valid_line = co_await read_command_line(socket, input, line);
-				if (!valid_line) {
-					co_await write_text(socket, "CLIENT_ERROR command line too long\r\n");
+				auto result = parser.parse(std::span(input.data(), input.size()), 128);
+				// 先执行成功解析的命令，确保响应顺序正确
+				co_await execute_batch(result.commands);
+				bool keep_connection = true;
+				if (result.stop == protocol::StopReason::Error) {
+					keep_connection = co_await handle_parse_error(socket, *result.error);
+				}
+				// 所有 CommandView 使用完毕后才能消费
+				input.erase(0, result.consumed);
+				if (!keep_connection) {
 					co_return;
 				}
-				if (line.empty()) {
+				if (result.stop == protocol::StopReason::Error || result.stop == protocol::StopReason::BatchLimit) {
+					// 继续解析剩余缓冲区
 					continue;
 				}
-				auto tokens = protocol::split_ws(line);
-				if (tokens.empty()) {
-					continue;
-				}
-				// const bool keep_connection = co_await parse(socket, input, std::move(tokens));
-				// if (!keep_connection) {
-				// co_return;
-				// }
+				// NeedMoreData 或 EndOfInput
+				std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
+				input.append(recv_buffer.data(), n);
 			}
 		} catch (const boost::system::system_error &e) {
 			if (e.code() != asio::error::eof && e.code() != asio::error::connection_reset &&
@@ -156,6 +135,7 @@ private:
 		asio::co_spawn(io_, accept_loop(), asio::detached);
 		io_.run();
 	}
+
 	awaitable<void> accept_loop() {
 		const std::size_t shard_id = worker_->current_shard_id();
 		const auto executor = co_await asio::this_coro::executor;
@@ -197,6 +177,7 @@ private:
 			asio::co_spawn(executor, session(std::move(socket)), asio::detached);
 		}
 	}
+
 	std::thread thread_;
 
 	asio::io_context io_;
