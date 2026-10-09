@@ -23,7 +23,7 @@ public:
 	using Sc = ShardComm<RequestMessage, ResponseMessage>;
 
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
-		: stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
+	    : stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
 	}
 
 	static std::vector<Worker> create_workers(std::size_t core_num, const std::shared_ptr<std::atomic_bool> &stop) {
@@ -128,35 +128,35 @@ public:
 	[[nodiscard]] std::size_t current_shard_id() const {
 		return shard_comm_.current_shard_id();
 	}
+	awaitable<void> handle_single_command(const protocol::SingleKeyCommand &c) {
+	}
+
+	awaitable<void> handle_multi_command(const protocol::MultiKeyCommand &c) {
+	}
 
 private:
 	[[nodiscard]] bool is_current_shard(const std::size_t hash) const {
 		return shard_comm_.is_current_shard(hash);
 	}
 
-	awaitable<void> handle_set(const SetCommand &c, const std::unique_ptr<RequestMessage> &message) {
-		data_.emplace(c.key, c.value);
-		ResponseMessage response{
-			.tcp_fd = message->tcp_fd, .seq = message->seq, .data = ResponseData{.command = {SetResponse{}}}};
-		co_await shard_comm_.send_response_shard(c.key.hash, std::make_unique<ResponseMessage>(response));
-	}
-
-	awaitable<void> handle_get(const GetCommand &c, std::unique_ptr<RequestMessage> &) {
-		data_[c.key];
-		co_return;
-	}
+	// awaitable<void> handle_set(const protocol::SetCommand &c, const std::unique_ptr<RequestMessage> &message) {
+	// 	data_.emplace(c.key, c.value);
+	// 	ResponseMessage response {
+	// 	    .tcp_fd = message->tcp_fd, .seq = message->seq, .data = ResponseData {.command = {SetResponse {}}}};
+	// 	co_await shard_comm_.send_response_shard(c.key.hash, std::make_unique<ResponseMessage>(response));
+	// }
 
 	awaitable<bool> handle_request_message(std::unique_ptr<RequestMessage> message) {
-		auto &cmd = message->data.command;
+		auto &cmd = message->data;
 		co_await std::visit(
-			[&, this](const auto &c) -> awaitable<void> {
-				using T = std::decay_t<decltype(c)>;
-				if constexpr (std::is_same_v<T, SetCommand>)
-					co_await handle_set(c, message);
-				else if constexpr (std::is_same_v<T, GetCommand>)
-					co_await handle_get(c, message);
-			},
-			cmd);
+		    [&, this](const auto &c) -> awaitable<void> {
+			    using T = std::decay_t<decltype(c)>;
+			    if constexpr (std::is_same_v<T, SingleKeyRequest>)
+				    co_await handle_single_command(c.command);
+			    else if constexpr (std::is_same_v<T, MultiKeyRequest>)
+				    co_await handle_multi_command(c.command);
+		    },
+		    cmd);
 		co_return true;
 	}
 
@@ -184,7 +184,7 @@ private:
 	// }
 
 	std::unordered_map<ItemKey, Item, KeyHash, KeyEqual> data_;
-	uint32_t seq_{0};
+	uint32_t seq_ {0};
 	RingArray<ResponseMessage> ring_array_;
 	std::shared_ptr<std::atomic_bool> stop_;
 	Sc shard_comm_;
