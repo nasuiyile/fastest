@@ -1,9 +1,10 @@
-## 设计文档
+## 核心设计
 
 兼容memcached文本协议，后续还兼容Meta协议。 每个网络线程均采取协作式调度，保留自己的Data HashMap。
 如果收到请求的数据，在解析后能被当前线程直接处理，那么直接完成处理，如果不能处理则投递给其他的线程。
 采取协作式调度保证了，每个请求处理线程在进行网络IO操作导致空闲的时候，也能处理其他线程来的请求。
-整体的线程运行机制类似于Dragonflydb的shared-nothing架构。整体采用C++20中Boost的，目前是C++20，正在调研是否升级到C++23。
+整体的线程运行机制类似于Dragonflydb的shared-nothing架构。整体采用C++20中Boost。
+网络采用io_uring+proactor模型。
 与Dragonflydb不同的地方在于每个线程都持有俩个mailbox，一个是用于接收别人发给自己的请求，另一个是用来接收别人发给自己的响应。因此请求响应都通过mailbox完成。
 这个mailbox是MPSC的，通过最新的库`<boost/lockfree/mpsc_weak_queue.hpp>`来实现，不使用SPSC是因为，如果要给每一个线程之间建立一个专用的通道，会导致NxN的通道数量，并且核心数多的情况下，轮询通道也会成为性能开销。
 在memcached协议中，需要顺序来回复用户的请求，因此当收到响应消息，就把该响应写到环形数组中。
@@ -24,7 +25,7 @@ async_wait → clear_notify → pop。
 收到回复：
 通过hashmap，来定位对应的TCP链接。
 环形数组中数组记录了下一个需要回复给用户消息的ID。另外每个回复的ID对数组长度求余得到写入的位置。
-如果 `当前回信的ID-下一个发给用户消息>=数组的长度`，那么说明环形数组满了，触发一次扩容操作。默认长度为32，扩容后更新数组长度.按每个槽保存的完整序号迁移到 seq % new_capacity。
+如果 `当前回信的ID-下一个发给用户消息>=数组的长度`，那么说明环形数组满了，触发一次扩容操作。默认长度为128，扩容后更新数组长度.按每个槽保存的完整序号迁移到 seq % new_capacity。
 如果收到5号槽信息，但是1号槽数据还没来，那么就继续消费队列。
 如果当前回信的ID等于下一个需要给用户回复消息的ID，那么就回复消息，然后检查下一个数组的位置是否为空，如果不为空就将下一个消息也发送给用户，然后将当前回信ID自增1 。
 直到下一个ID为空，那么就继续消费。在发送给用户结束之后,清空已经发送的元素.
@@ -32,5 +33,25 @@ async_wait → clear_notify → pop。
 ## 补充
 `<boost/lockfree/mpsc_weak_queue.hpp>` 是Vyukov MPSC，允许多个线程写入数据，只有一个线程可以读取。 读写都是无锁的。即便这个队列被设置为无界的，在没有发生扩容时，依然是无锁的（有界版本性能稍有优势）。
 
+解析时，先将当前buffer中已经到达的多条命令先解析，让这些命令自然的形成批次。
+
 后续实现doorbell suppression / coalescing机制。
-如果系统底层是epoll的，读取的时候采用LT。
+给每个mailbox添加一个`atomic<bool>`，表示已经有人敲过门了。生产者
+~~~C++
+if (!notify_pending_.exchange(true)) {
+    notify();
+}
+~~~
+exchange(true) 把标志设为 true，同时返回旧值：
+- 旧值为 false：我是第一个敲门的，调用 notify()。
+- 旧值为 true：已经有人敲过了，直接跳过通知。
+
+消费者醒来后按这个顺序处理：
+~~~C++
+clear_notify();                  // 清掉 eventfd 通知
+notify_pending_.exchange(false); // 允许下一轮敲门
+while (pop(message)) {
+    handle(message);
+}
+~~~
+从第一个生产者敲门，到消费者开始一轮消费之前。这期间线程可能在休眠，也可能已经醒了、正在处理其他socket操作。减少了syscall。
