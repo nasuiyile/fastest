@@ -53,7 +53,6 @@ struct ResponseMessage {
 struct RequestMessage {
 	uint32_t tcp_fd; // tcp的32位fd编号
 	uint32_t seq;    // 请求编号，允许回绕
-	uint64_t hash;   // 投递的hash值
 	RequestData data;
 };
 

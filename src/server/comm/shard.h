@@ -68,24 +68,25 @@ public:
 		return get_shard(hash) == shard_id_;
 	}
 
-	awaitable<bool> send_request_to_shard(const uint64_t hash, std::unique_ptr<Request> message) {
-		std::size_t shard_id = get_shard(hash);
+	bool send_request_to_shard(std::size_t shard_id, std::unique_ptr<Request> message) {
 		Mailbox<Request> &mailbox = request_mailbox->mailbox(shard_id);
 		if (mailbox.try_push(message)) {
-			co_return true;
+			return true;
 		}
-		co_return false;
+		return false;
 	}
 
-	awaitable<bool> send_response_shard(const uint64_t hash, std::unique_ptr<Response> message) {
-		std::size_t shard_id = get_shard(hash);
+	bool send_response_shard(std::size_t shard_id, std::unique_ptr<Response> message) {
 		Mailbox<Response> &mailbox = response_mailbox->mailbox(shard_id);
 		if (mailbox.try_push(message)) {
-			co_return true;
+			return true;
 		}
-		co_return false;
+		return false;
 	}
 
+	[[nodiscard]] inline std::size_t get_shard(const uint64_t hash) const {
+		return util::get_shard(hash, shard_num_);
+	}
 
 	ShardComm(const ShardComm &) = delete;
 
@@ -96,10 +97,6 @@ public:
 	ShardComm &operator=(ShardComm &&) noexcept = default;
 
 private:
-	[[nodiscard]] inline std::size_t get_shard(const uint64_t hash) const {
-		return util::get_shard(hash, shard_num_);
-	}
-
 	ShardComm(const std::size_t shard_id, const std::size_t shard_num,
 	          std::shared_ptr<SharedSystem<Request> > request_mailbox,
 	          std::shared_ptr<SharedSystem<Response> > response_mailbox)

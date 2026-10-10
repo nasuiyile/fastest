@@ -23,7 +23,7 @@ public:
 	using Sc = ShardComm<RequestMessage, ResponseMessage>;
 
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
-	    : stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
+		: stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
 	}
 
 	static std::vector<Worker> create_workers(std::size_t core_num, const std::shared_ptr<std::atomic_bool> &stop) {
@@ -128,7 +128,15 @@ public:
 	[[nodiscard]] std::size_t current_shard_id() const {
 		return shard_comm_.current_shard_id();
 	}
-	awaitable<void> handle_single_command(const protocol::SingleKeyCommand &c) {
+
+	void handle_single_command(SingleKeyRequest &request, uint32_t tcp_fd) {
+		const std::size_t shard = shard_comm_.get_shard(request.hash);
+		RequestMessage request_message = {.tcp_fd = tcp_fd,
+		                                  .seq = seq_++,
+		                                  .data = RequestData{
+			                                  request
+		                                  }};
+		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
 	}
 
 	awaitable<void> handle_multi_command(const protocol::MultiKeyCommand &c) {
@@ -138,6 +146,15 @@ private:
 	[[nodiscard]] bool is_current_shard(const std::size_t hash) const {
 		return shard_comm_.is_current_shard(hash);
 	}
+
+	// awaitable<bool> send_request_to_shard(const RequestData &request_data, const uint32_t tcp_fd) {
+	// 	const uint64_t hash = request_data.command.hash();
+	// 	RequestMessage request_message = {.tcp_fd = tcp_fd,
+	// 	                                  .seq = seq_++,
+	// 	                                  .origin_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+	// 	                                  .data = (request_data)};
+	// 	return shard_comm_.send_request_to_shard(hash, std::make_unique<RequestMessage>(std::move(request_message)));
+	// }
 
 	// awaitable<void> handle_set(const protocol::SetCommand &c, const std::unique_ptr<RequestMessage> &message) {
 	// 	data_.emplace(c.key, c.value);
@@ -149,14 +166,15 @@ private:
 	awaitable<bool> handle_request_message(std::unique_ptr<RequestMessage> message) {
 		auto &cmd = message->data;
 		co_await std::visit(
-		    [&, this](const auto &c) -> awaitable<void> {
-			    using T = std::decay_t<decltype(c)>;
-			    if constexpr (std::is_same_v<T, SingleKeyRequest>)
-				    co_await handle_single_command(c.command);
-			    else if constexpr (std::is_same_v<T, MultiKeyRequest>)
-				    co_await handle_multi_command(c.command);
-		    },
-		    cmd);
+			[&, this](const auto &c) -> awaitable<void> {
+				using T = std::decay_t<decltype(c)>;
+				if constexpr (std::is_same_v<T, SingleKeyRequest>) {
+				}
+				// handle_single_command(c, 1);
+				else if constexpr (std::is_same_v<T, MultiKeyRequest>)
+					co_await handle_multi_command(c.command);
+			},
+			cmd);
 		co_return true;
 	}
 
@@ -174,17 +192,9 @@ private:
 		}
 	}
 
-	// awaitable<bool> send_request_to_shard(const RequestData &request_data, const uint32_t tcp_fd) {
-	// 	const uint64_t hash = request_data.command.hash();
-	// 	RequestMessage request_message = {.tcp_fd = tcp_fd,
-	// 	                                  .seq = seq_++,
-	// 	                                  .origin_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-	// 	                                  .data = (request_data)};
-	// 	return shard_comm_.send_request_to_shard(hash, std::make_unique<RequestMessage>(std::move(request_message)));
-	// }
 
 	std::unordered_map<ItemKey, Item, KeyHash, KeyEqual> data_;
-	uint32_t seq_ {0};
+	uint32_t seq_{0};
 	RingArray<ResponseMessage> ring_array_;
 	std::shared_ptr<std::atomic_bool> stop_;
 	Sc shard_comm_;

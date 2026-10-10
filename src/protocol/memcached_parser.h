@@ -168,6 +168,19 @@ using SingleKeyCommand =
     std::variant<SetCommand, AddCommand, ReplaceCommand, AppendCommand, PrependCommand, CasCommand,
                  SingleGetCommand, SingleGetsCommand, SingleGatCommand, SingleGatsCommand,
                  DeleteCommand, TouchCommand, IncrCommand, DecrCommand>;
+inline std::uint64_t hash(const SingleKeyCommand& command) {
+	return std::visit(
+		[](const auto& value) -> std::uint64_t {
+			using T = std::remove_cvref_t<decltype(value)>;
+			if constexpr (requires { value.key; }) {
+				return static_cast<std::uint64_t>(
+					std::hash<std::string_view>{}(value.key));
+			} else {
+				return 0;
+			}
+		},
+		command);
+}
 
 using MultiKeyCommand = std::variant<MultiGetCommand, MultiGetsCommand, MultiGatCommand, MultiGatsCommand>;
 
