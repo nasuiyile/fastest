@@ -81,20 +81,16 @@ private:
 		co_return error.recovery == protocol::ErrorRecovery::Continue;
 	}
 
-	void execute_batch(const std::vector<protocol::Command> &vector) {
+	void execute_batch(const std::vector<protocol::Command> &vector, uint64_t tcp_id) {
 		for (protocol::Command variant : vector) {
 			std::visit(
-			    [this](auto &&arg) {
+			    [this, tcp_id](auto &&arg) {
 				    using T = std::decay_t<decltype(arg)>;
 				    if constexpr (std::is_same_v<T, protocol::SingleKeyCommand>) {
-					    std::visit(
-					        [this](auto &&req) {
-						        // req 现在才是 SingleKeyRequest 的某个具体类型
-						        uint64_t hash = protocol::hash(req);
-						        SingleKeyRequest single_key_request = {.hash = hash, .command = req};
-						        worker_->send_single_command(single_key_request, 1);
-					        },
-					        arg);
+					    // req 现在才是 SingleKeyRequest 的某个具体类型
+					    uint64_t hash = protocol::hash(arg);
+					    SingleKeyRequest single_key_request = {.hash = hash, .command = arg};
+					    worker_->send_single_command(single_key_request, tcp_id);
 				    } else if constexpr (std::is_same_v<T, protocol::MultiKeyCommand>) {
 					    // 同理，MultiKeyCommand 大概也是 variant，需要再 visit
 				    } else if constexpr (std::is_same_v<T, protocol::NoKeyCommand>) {
@@ -117,7 +113,7 @@ private:
 			while (!stop_->load(std::memory_order_relaxed)) {
 				auto result = parser.parse(std::span(input.data(), input.size()), 128);
 				// 先执行成功解析的命令，确保响应顺序正确
-				execute_batch(result.commands);
+				execute_batch(result.commands, tcp_id);
 				bool keep_connection = true;
 				if (result.stop == protocol::StopReason::Error) {
 					keep_connection = co_await handle_parse_error(socket, *result.error);
@@ -197,13 +193,14 @@ private:
 				continue;
 			}
 			auto ptr = std::make_unique<TCPSession>(std::move(socket));
-			worker_->tcp_session_.emplace(tcp_seq_++, std::move(ptr));
-			asio::co_spawn(executor, session(tcp_seq_), asio::detached);
-			worker_->tcp_session_.erase(tcp_seq_++);
+			worker_->tcp_session_.emplace(tcp_id_++, std::move(ptr));
+			asio::co_spawn(executor, session(tcp_id_), asio::detached);
+			worker_->tcp_session_.erase(tcp_id_++);
 		}
 	}
 
-	uint64_t tcp_seq_ {0};
+	// 每次收到TCP都分配一个新版本号
+	uint64_t tcp_id_ {0};
 
 	std::thread thread_;
 

@@ -141,10 +141,10 @@ public:
 	void hand_single_command(const protocol::SingleKeyCommand &c) {
 	}
 
-	void send_single_command(SingleKeyRequest &request, const uint64_t tcp_seq) {
+	void send_single_command(SingleKeyRequest &request, const uint64_t tcp_id) {
 		const std::size_t shard = shard_comm_.get_shard(request.hash);
 		RequestMessage request_message = {
-		    .tcp_seq = tcp_seq, .seq = tcp_session_[tcp_seq]->seq++, .data = RequestData {request}};
+		    .tcp_id = tcp_id, .seq = tcp_session_[tcp_id]->seq++, .data = RequestData {request}};
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
 	}
 
