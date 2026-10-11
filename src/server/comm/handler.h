@@ -25,15 +25,15 @@ public:
 		thread_ = std::thread([this] { run(); });
 	}
 
-	static std::vector<std::unique_ptr<Handler> > create_handlers(const Config &cfg) {
+	static std::vector<std::unique_ptr<Handler>> create_handlers(const Config &cfg) {
 		const std::size_t core_num = util::core_num();
-		auto stop = std::make_shared<std::atomic_bool>(false);
+		const auto stop = std::make_shared<std::atomic_bool>(false);
 		auto workers = Worker::create_workers(core_num, stop);
-		std::vector<std::unique_ptr<Handler> > handlers;
+		std::vector<std::unique_ptr<Handler>> handlers;
 		handlers.reserve(workers.size());
 		for (auto &worker : workers) {
 			handlers.push_back(
-				std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
+			    std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
 		}
 		return handlers;
 	}
@@ -46,7 +46,7 @@ public:
 
 private:
 	explicit Handler(Config config, std::unique_ptr<Worker> worker, std::shared_ptr<std::atomic_bool> stop)
-		: config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
+	    : config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
 	}
 
 	// 最大读取命令行的限制，命令行是\r\n结尾的
@@ -81,44 +81,43 @@ private:
 		co_return error.recovery == protocol::ErrorRecovery::Continue;
 	}
 
-	awaitable<void> execute_batch(const std::vector<protocol::Command> &vector) {
+	void execute_batch(const std::vector<protocol::Command> &vector) {
 		for (protocol::Command variant : vector) {
 			std::visit(
-				[this](auto &&arg) {
-					using T = std::decay_t<decltype(arg)>;
-					if constexpr (std::is_same_v<T, protocol::SingleKeyCommand>) {
-						std::visit(
-							[this](auto &&req) {
-								// req 现在才是 SingleKeyRequest 的某个具体类型
-								uint64_t hash = protocol::hash(req);
-								SingleKeyRequest single_key_request = {
-									.hash = hash,
-									.command = req
-								};
-								worker_->handle_single_command(single_key_request, 1);
-							},
-							arg);
-					} else if constexpr (std::is_same_v<T, protocol::MultiKeyCommand>) {
-						// 同理，MultiKeyCommand 大概也是 variant，需要再 visit
-					} else if constexpr (std::is_same_v<T, protocol::NoKeyCommand>) {
-						// ...
-					}
-				},
-				variant);
+			    [this](auto &&arg) {
+				    using T = std::decay_t<decltype(arg)>;
+				    if constexpr (std::is_same_v<T, protocol::SingleKeyCommand>) {
+					    std::visit(
+					        [this](auto &&req) {
+						        // req 现在才是 SingleKeyRequest 的某个具体类型
+						        uint64_t hash = protocol::hash(req);
+						        SingleKeyRequest single_key_request = {.hash = hash, .command = req};
+						        worker_->send_single_command(single_key_request, 1);
+					        },
+					        arg);
+				    } else if constexpr (std::is_same_v<T, protocol::MultiKeyCommand>) {
+					    // 同理，MultiKeyCommand 大概也是 variant，需要再 visit
+				    } else if constexpr (std::is_same_v<T, protocol::NoKeyCommand>) {
+					    // ...
+				    }
+			    },
+			    variant);
 		}
 	};
 
-	awaitable<void> session(tcp::socket socket) {
+	awaitable<void> session(const uint64_t tcp_id) {
+		const auto tcp_session = std::move(worker_->tcp_session_[tcp_id]);
+		tcp::socket socket = std::move(tcp_session->socket);
 		std::size_t shard_id = worker_->current_shard_id();
 		try {
 			const protocol::MemcachedParser parser;
 			// 保留上一次没有解析完的数据
 			std::string input;
-			std::array<char, 4096> recv_buffer{};
+			std::array<char, 4096> recv_buffer {};
 			while (!stop_->load(std::memory_order_relaxed)) {
 				auto result = parser.parse(std::span(input.data(), input.size()), 128);
 				// 先执行成功解析的命令，确保响应顺序正确
-				co_await execute_batch(result.commands);
+				execute_batch(result.commands);
 				bool keep_connection = true;
 				if (result.stop == protocol::StopReason::Error) {
 					keep_connection = co_await handle_parse_error(socket, *result.error);
@@ -133,7 +132,7 @@ private:
 					continue;
 				}
 				// NeedMoreData 或 EndOfInput
-				std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
+				const std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
 				input.append(recv_buffer.data(), n);
 			}
 		} catch (const boost::system::system_error &e) {
@@ -174,7 +173,7 @@ private:
 			acceptor.open(endpoint.protocol());
 			acceptor.set_option(asio::socket_base::reuse_address(true));
 #ifdef SO_REUSEPORT
-			int reuse_port = 1;
+			constexpr int reuse_port = 1;
 			if (::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT, &reuse_port, sizeof(reuse_port)) ==
 			    -1) {
 				spdlog::error("[shard {}] SO_REUSEPORT failed: {}", shard_id, std::strerror(errno));
@@ -197,9 +196,14 @@ private:
 				spdlog::warn("[shard {}] accept failed: {}", shard_id, ec.message());
 				continue;
 			}
-			asio::co_spawn(executor, session(std::move(socket)), asio::detached);
+			auto ptr = std::make_unique<TCPSession>(std::move(socket));
+			worker_->tcp_session_.emplace(tcp_seq_++, std::move(ptr));
+			asio::co_spawn(executor, session(tcp_seq_), asio::detached);
+			worker_->tcp_session_.erase(tcp_seq_++);
 		}
 	}
+
+	uint64_t tcp_seq_ {0};
 
 	std::thread thread_;
 

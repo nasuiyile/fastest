@@ -45,14 +45,14 @@ using RequestData = std::variant<SingleKeyRequest, MultiKeyRequest>;
 using ResponseData = std::variant<protocol::SingleKeyResponse, MultiKeyResponse>;
 
 struct ResponseMessage {
-	uint32_t tcp_fd; // tcp的32位fd编号
-	uint32_t seq;    // 请求编号，允许回绕
+	uint64_t tcp_num; // tcp的32位fd编号
+	uint32_t seq;     // 请求编号，允许回绕
 	ResponseData data;
 };
 // 负责抽象发送数据 和响应回调，每个线程都持有这样一个worker，并且可以通过worker和其他线程的mailbox来进行通信
 struct RequestMessage {
-	uint32_t tcp_fd; // tcp的32位fd编号
-	uint32_t seq;    // 请求编号，允许回绕
+	uint64_t tcp_seq; // tcp的32位fd编号
+	uint32_t seq;     // 请求编号，允许回绕
 	RequestData data;
 };
 
