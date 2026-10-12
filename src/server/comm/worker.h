@@ -20,22 +20,23 @@ using asio::ip::tcp;
 
 struct TCPSession {
 	tcp::socket socket;
-	RingArray<ResponseMessage> ring_array;
-	uint32_t seq {0};
+	RingArray ring_array;
+	uint32_t seq{0};
+
 	explicit TCPSession(tcp::socket &&s) : socket(std::move(s)) {
 	}
 };
 
 class Worker {
 public:
-	std::unordered_map<uint64_t, std::unique_ptr<TCPSession>> tcp_session_;
+	std::unordered_map<uint64_t, std::unique_ptr<TCPSession> > tcp_session_;
 	using Sc = ShardComm<RequestMessage, ResponseMessage>;
 
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
-	    : stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
+		: stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
 	}
 
-	static std::vector<Worker> create_workers(std::size_t core_num, const std::shared_ptr<std::atomic_bool> &stop) {
+	static std::vector<Worker> create_workers(const std::size_t core_num, const std::shared_ptr<std::atomic_bool> &stop) {
 		std::vector<Sc> shard_comm = Sc::create_shard_comm(core_num);
 		// 所有 Worker 共享同一个 stop
 		std::vector<Worker> workers;
@@ -144,7 +145,7 @@ public:
 	void send_single_command(SingleKeyRequest &request, const uint64_t tcp_id) {
 		const std::size_t shard = shard_comm_.get_shard(request.hash);
 		RequestMessage request_message = {
-		    .tcp_id = tcp_id, .seq = tcp_session_[tcp_id]->seq++, .data = RequestData {request}};
+			.tcp_id = tcp_id, .seq = tcp_session_[tcp_id]->seq++, .data = RequestData{request}};
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
 	}
 
@@ -175,19 +176,20 @@ private:
 	awaitable<bool> handle_request_message(std::unique_ptr<RequestMessage> message) {
 		auto &cmd = message->data;
 		co_await std::visit(
-		    [&, this](const auto &c) -> awaitable<void> {
-			    using T = std::decay_t<decltype(c)>;
-			    if constexpr (std::is_same_v<T, SingleKeyRequest>) {
-			    } else if constexpr (std::is_same_v<T, MultiKeyRequest>)
-				    co_await handle_multi_command(c.command);
-		    },
-		    cmd);
+			[&, this](const auto &c) -> awaitable<void> {
+				using T = std::decay_t<decltype(c)>;
+				if constexpr (std::is_same_v<T, SingleKeyRequest>) {
+				} else if constexpr (std::is_same_v<T, MultiKeyRequest>)
+					co_await handle_multi_command(c.command);
+			},
+			cmd);
 		co_return true;
 	}
 
-	void handle_response_message(std::unique_ptr<ResponseMessage> message) {
+	void handle_response_message(const std::unique_ptr<ResponseMessage> &message) {
 		// 写到环形数组中。如果满足回复client的条件，获得对应的TCP socket，写入TCP socket。
 		auto ring_array = tcp_session_[message->tcp_num]->ring_array;
+		ring_array.append(*message);
 		while (ring_array.is_ready()) {
 			std::optional<ResponseMessage> response_message = ring_array.try_pop();
 			if (!response_message.has_value()) {

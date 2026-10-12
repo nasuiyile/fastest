@@ -40,9 +40,13 @@ struct MultiKeyResponse {
 	protocol::MultiKeyResponse command;
 };
 
+
+
 // 包含俩种枚举，分别是多key和单key操作
 using RequestData = std::variant<SingleKeyRequest, MultiKeyRequest>;
 using ResponseData = std::variant<protocol::SingleKeyResponse, protocol::ErrorResponse, MultiKeyResponse>;
+
+using RingResponseData = std::variant<protocol::SingleKeyResponse, protocol::ErrorResponse, std::vector<MultiKeyResponse>>;
 
 struct ResponseMessage {
 	uint64_t tcp_num; // tcp编号
