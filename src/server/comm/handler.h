@@ -58,8 +58,8 @@ private:
 		co_await asio::async_write(socket, asio::buffer(text.data(), text.size()), use_awaitable);
 	}
 
-	static std::string_view parse_error_message(protocol::ParseErrorCode code) noexcept {
-		using enum protocol::ParseErrorCode;
+	static std::string_view parse_error_message(ParseErrorCode code) noexcept {
+		using enum ParseErrorCode;
 		switch (code) {
 		case UnknownCommand:
 			return "ERROR\r\n";
@@ -76,24 +76,21 @@ private:
 		}
 	}
 
-	static awaitable<bool> handle_parse_error(tcp::socket &socket, const protocol::ParseError &error) {
+	static awaitable<bool> handle_parse_error(tcp::socket &socket, const ParseError &error) {
 		co_await write_text(socket, parse_error_message(error.code));
-		co_return error.recovery == protocol::ErrorRecovery::Continue;
+		co_return error.recovery == ErrorRecovery::Continue;
 	}
 
-	void execute_batch(const std::vector<protocol::Command> &vector, uint64_t tcp_id) {
-		for (protocol::Command variant : vector) {
+	void execute_batch(const std::vector<Command> &vector, uint64_t tcp_id) {
+		for (Command variant : vector) {
 			std::visit(
 			    [this, tcp_id](auto &&arg) {
 				    using T = std::decay_t<decltype(arg)>;
-				    if constexpr (std::is_same_v<T, protocol::SingleKeyCommand>) {
-					    // req 现在才是 SingleKeyRequest 的某个具体类型
-					    uint64_t hash = protocol::hash(arg);
-					    SingleKeyRequest single_key_request = {.hash = hash, .command = arg};
-					    worker_->send_single_command(single_key_request, tcp_id);
-				    } else if constexpr (std::is_same_v<T, protocol::MultiKeyCommand>) {
-					    // 同理，MultiKeyCommand 大概也是 variant，需要再 visit
-				    } else if constexpr (std::is_same_v<T, protocol::NoKeyCommand>) {
+				    if constexpr (std::is_same_v<T, SingleKeyCommand>) {
+					    worker_->send_single_command(arg, tcp_id);
+				    } else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
+					    worker_->send_multi_command(arg, tcp_id);
+				    } else if constexpr (std::is_same_v<T, NoKeyCommand>) {
 					    // ...
 				    }
 			    },
@@ -106,7 +103,7 @@ private:
 		tcp::socket socket = std::move(tcp_session->socket);
 		std::size_t shard_id = worker_->current_shard_id();
 		try {
-			const protocol::MemcachedParser parser;
+			const MemcachedParser parser;
 			// 保留上一次没有解析完的数据
 			std::string input;
 			std::array<char, 4096> recv_buffer {};
@@ -115,7 +112,7 @@ private:
 				// 先执行成功解析的命令，确保响应顺序正确
 				execute_batch(result.commands, tcp_id);
 				bool keep_connection = true;
-				if (result.stop == protocol::StopReason::Error) {
+				if (result.stop == StopReason::Error) {
 					keep_connection = co_await handle_parse_error(socket, *result.error);
 				}
 				// 所有 CommandView 使用完毕后才能消费
@@ -123,7 +120,7 @@ private:
 				if (!keep_connection) {
 					co_return;
 				}
-				if (result.stop == protocol::StopReason::Error || result.stop == protocol::StopReason::BatchLimit) {
+				if (result.stop == StopReason::Error || result.stop == StopReason::BatchLimit) {
 					// 继续解析剩余缓冲区
 					continue;
 				}

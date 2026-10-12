@@ -1,9 +1,7 @@
 #pragma once
 
-#include "../../util/hardware_info.h"
 #include <boost/asio.hpp>
 #include <cstring>
-
 #include <vector>
 
 #include "ring_array.h"
@@ -21,7 +19,7 @@ using asio::ip::tcp;
 struct TCPSession {
 	tcp::socket socket;
 	RingArray ring_array;
-	uint32_t seq{0};
+	uint32_t seq {0};
 
 	explicit TCPSession(tcp::socket &&s) : socket(std::move(s)) {
 	}
@@ -29,14 +27,15 @@ struct TCPSession {
 
 class Worker {
 public:
-	std::unordered_map<uint64_t, std::unique_ptr<TCPSession> > tcp_session_;
+	std::unordered_map<uint64_t, std::unique_ptr<TCPSession>> tcp_session_;
 	using Sc = ShardComm<RequestMessage, ResponseMessage>;
 
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
-		: stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
+	    : stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
 	}
 
-	static std::vector<Worker> create_workers(const std::size_t core_num, const std::shared_ptr<std::atomic_bool> &stop) {
+	static std::vector<Worker> create_workers(const std::size_t core_num,
+	                                          const std::shared_ptr<std::atomic_bool> &stop) {
 		std::vector<Sc> shard_comm = Sc::create_shard_comm(core_num);
 		// 所有 Worker 共享同一个 stop
 		std::vector<Worker> workers;
@@ -47,7 +46,7 @@ public:
 		return workers;
 	}
 
-	void do_operation(protocol::Command command, const uint32_t tcp_fd) {
+	void do_operation(Command command, const uint32_t tcp_fd) {
 	}
 
 	// awaitable<bool> set(Key k, const Item &item, const uint32_t tcp_fd) {
@@ -139,17 +138,40 @@ public:
 		return shard_comm_.current_shard_id();
 	}
 
-	void hand_single_command(const protocol::SingleKeyCommand &c) {
+	void hand_single_command(const SingleKeyCommand &c) {
+	}
+	void send_multi_command(MultiKeyCommand &command, const uint64_t tcp_id) {
+		const std::vector<ItemKey> &item_keys = command.item_keys();
+		uint16_t counter = 0;
+		for (size_t i = 0; i < item_keys.size(); i++) {
+			std::size_t shard = shard_comm_.get_shard(item_keys[i].hash);
+			if (!multi_key_index_[shard].has_value()) {
+				counter++;
+				multi_key_index_[shard] = std::vector<ItemKey> {item_keys[i]};
+			} else {
+				multi_key_index_[shard].value().emplace_back(item_keys[i]);
+			}
+		}
+		const uint32_t seq = tcp_session_[tcp_id]->seq++;
+		for (auto key_array : multi_key_index_) {
+			if (!key_array.has_value()) {
+				continue;
+			}
+			auto key_views = key_array.value();
+			// MultiKeyRequest {.count = counter, .command = };
+			// RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq};
+		}
 	}
 
-	void send_single_command(SingleKeyRequest &request, const uint64_t tcp_id) {
-		const std::size_t shard = shard_comm_.get_shard(request.hash);
+	void send_single_command(SingleKeyCommand &command, const uint64_t tcp_id) {
+		SingleKeyRequest request = {.command = command};
+		const std::size_t shard = shard_comm_.get_shard(command.item_key().hash);
 		RequestMessage request_message = {
-			.tcp_id = tcp_id, .seq = tcp_session_[tcp_id]->seq++, .data = RequestData{request}};
+		    .tcp_id = tcp_id, .seq = tcp_session_[tcp_id]->seq++, .data = RequestData {request}};
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
 	}
 
-	awaitable<void> handle_multi_command(const protocol::MultiKeyCommand &c) {
+	awaitable<void> handle_multi_command(const MultiKeyCommand &c) {
 	}
 
 private:
@@ -176,13 +198,13 @@ private:
 	awaitable<bool> handle_request_message(std::unique_ptr<RequestMessage> message) {
 		auto &cmd = message->data;
 		co_await std::visit(
-			[&, this](const auto &c) -> awaitable<void> {
-				using T = std::decay_t<decltype(c)>;
-				if constexpr (std::is_same_v<T, SingleKeyRequest>) {
-				} else if constexpr (std::is_same_v<T, MultiKeyRequest>)
-					co_await handle_multi_command(c.command);
-			},
-			cmd);
+		    [&, this](const auto &c) -> awaitable<void> {
+			    using T = std::decay_t<decltype(c)>;
+			    if constexpr (std::is_same_v<T, SingleKeyRequest>) {
+			    } else if constexpr (std::is_same_v<T, MultiKeyRequest>)
+				    co_await handle_multi_command(c.command);
+		    },
+		    cmd);
 		co_return true;
 	}
 
@@ -191,18 +213,19 @@ private:
 		auto ring_array = tcp_session_[message->tcp_num]->ring_array;
 		ring_array.append(*message);
 		while (ring_array.is_ready()) {
-			std::optional<ResponseMessage> response_message = ring_array.try_pop();
+			std::optional<RingResponseMessage> response_message = ring_array.try_pop();
 			if (!response_message.has_value()) {
 				return;
 			}
 
-			ResponseMessage &msg = *response_message;
+			RingResponseMessage &msg = *response_message;
 			// 真正写入TCP中
 		}
 	}
 
 	std::unordered_map<ItemKey, Item, KeyHash, KeyEqual> data_;
-
+	// 长度和CPU核心数一样
+	std::vector<std::optional<std::vector<ItemKey>>> multi_key_index_;
 	std::shared_ptr<std::atomic_bool> stop_;
 	Sc shard_comm_;
 };

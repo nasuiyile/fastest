@@ -6,6 +6,8 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <functional>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
@@ -13,7 +15,21 @@
 #include <variant>
 #include <vector>
 
-namespace protocol {
+namespace comm {
+using Value = std::string;
+using Key = std::string;
+struct ItemKey {
+	uint64_t hash {0};
+	Key key;
+
+	explicit ItemKey(Key k) : hash(std::hash<Key> {}(k)), key(std::move(k)) {
+	}
+};
+struct Item {
+	uint32_t flags {0};
+	Value value;
+};
+
 // CommandType 保留协议命令名；单 Key / 多 Key 由具体 C++ 类型和外层 variant 区分。
 enum class CommandType : std::uint8_t {
 	Set,
@@ -30,8 +46,8 @@ enum class CommandType : std::uint8_t {
 	Touch,
 	Incr,
 	Decr,
-	FlushAll, // 删除全库 底层实际只是更新了删除的时间
-	Stats,    // 统计
+	FlushAll,  // 删除全库 底层实际只是更新了删除的时间
+	Stats,     // 统计
 	Verbosity, // 调整日志级别
 	Version,   // 返回服务器版本号
 	Quit       // 关闭当前客户端连接
@@ -43,7 +59,7 @@ template <CommandType Type>
 struct StorageCommandT {
 	static constexpr CommandType command_type = Type;
 
-	std::string_view key;
+	ItemKey key;
 	std::uint32_t flags = 0;
 	std::uint32_t exptime = 0;
 	std::string_view value;
@@ -59,7 +75,7 @@ using PrependCommand = StorageCommandT<CommandType::Prepend>;
 struct CasCommand {
 	static constexpr CommandType command_type = CommandType::Cas;
 
-	std::string_view key;
+	ItemKey key;
 	std::uint32_t flags = 0;
 	std::uint32_t exptime = 0;
 	std::string_view value;
@@ -72,14 +88,14 @@ template <CommandType Type>
 struct SingleRetrievalCommandT {
 	static constexpr CommandType command_type = Type;
 
-	std::string_view key;
+	ItemKey key;
 };
 
 template <CommandType Type>
 struct MultiRetrievalCommandT {
 	static constexpr CommandType command_type = Type;
 
-	std::vector<std::string_view> keys;
+	std::vector<ItemKey> keys;
 };
 
 using SingleGetCommand = SingleRetrievalCommandT<CommandType::Get>;
@@ -92,7 +108,7 @@ struct SingleGetAndTouchCommandT {
 	static constexpr CommandType command_type = Type;
 
 	std::uint32_t exptime = 0;
-	std::string_view key;
+	ItemKey key;
 };
 
 template <CommandType Type>
@@ -100,7 +116,7 @@ struct MultiGetAndTouchCommandT {
 	static constexpr CommandType command_type = Type;
 
 	std::uint32_t exptime = 0;
-	std::vector<std::string_view> keys;
+	std::vector<ItemKey> keys;
 };
 
 using SingleGatCommand = SingleGetAndTouchCommandT<CommandType::Gat>;
@@ -111,14 +127,14 @@ using MultiGatsCommand = MultiGetAndTouchCommandT<CommandType::Gats>;
 struct DeleteCommand {
 	static constexpr CommandType command_type = CommandType::Delete;
 
-	std::string_view key;
+	ItemKey key;
 	bool noreply = false;
 };
 
 struct TouchCommand {
 	static constexpr CommandType command_type = CommandType::Touch;
 
-	std::string_view key;
+	ItemKey key;
 	std::uint32_t exptime = 0;
 	bool noreply = false;
 };
@@ -127,7 +143,7 @@ template <CommandType Type>
 struct ArithmeticCommandT {
 	static constexpr CommandType command_type = Type;
 
-	std::string_view key;
+	ItemKey key;
 	std::uint64_t delta = 0;
 	bool noreply = false;
 };
@@ -164,23 +180,41 @@ struct QuitCommand {
 };
 
 // 第一层按路由粒度区分；第二层保留每种具体命令的独立 variant 类型。
-using SingleKeyCommand = std::variant<SetCommand, AddCommand, ReplaceCommand, AppendCommand, PrependCommand, CasCommand,
-                                      SingleGetCommand, SingleGetsCommand, SingleGatCommand, SingleGatsCommand,
-                                      DeleteCommand, TouchCommand, IncrCommand, DecrCommand>;
+struct SingleKeyCommand {
+	using Variant = std::variant<SetCommand, AddCommand, ReplaceCommand, AppendCommand, PrependCommand, CasCommand,
+	                             SingleGetCommand, SingleGetsCommand, SingleGatCommand, SingleGatsCommand,
+	                             DeleteCommand, TouchCommand, IncrCommand, DecrCommand>;
+
+	Variant command;
+
+	template <typename T>
+	    requires std::is_constructible_v<Variant, T>
+	explicit SingleKeyCommand(T value) : command(std::move(value)) {
+	}
+
+	[[nodiscard]] const ItemKey &item_key() const {
+		return std::visit([](const auto &value) -> const ItemKey & { return value.key; }, command);
+	}
+};
+
 inline std::uint64_t hash(const SingleKeyCommand &command) {
-	return std::visit(
-	    [](const auto &value) -> std::uint64_t {
-		    using T = std::remove_cvref_t<decltype(value)>;
-		    if constexpr (requires { value.key; }) {
-			    return static_cast<std::uint64_t>(std::hash<std::string_view> {}(value.key));
-		    } else {
-			    return 0;
-		    }
-	    },
-	    command);
+	return command.item_key().hash;
 }
 
-using MultiKeyCommand = std::variant<MultiGetCommand, MultiGetsCommand, MultiGatCommand, MultiGatsCommand>;
+struct MultiKeyCommand {
+	using Variant = std::variant<MultiGetCommand, MultiGetsCommand, MultiGatCommand, MultiGatsCommand>;
+
+	Variant command;
+
+	template <typename T>
+	    requires std::is_constructible_v<Variant, T>
+	explicit MultiKeyCommand(T value) : command(std::move(value)) {
+	}
+
+	[[nodiscard]] const std::vector<ItemKey> &item_keys() const {
+		return std::visit([](const auto &value) -> const std::vector<ItemKey> & { return value.keys; }, command);
+	}
+};
 
 // 以下命令不携带用于 hash 分片的 Key。
 using NoKeyCommand = std::variant<FlushAllCommand, VerbosityCommand, StatsCommand, VersionCommand, QuitCommand>;
@@ -191,9 +225,16 @@ using Command = std::variant<SingleKeyCommand, MultiKeyCommand, NoKeyCommand>;
 inline CommandType command_type(const Command &command) {
 	return std::visit(
 	    [](const auto &group) -> CommandType {
-		    return std::visit(
-		        [](const auto &value) -> CommandType { return std::remove_cvref_t<decltype(value)>::command_type; },
-		        group);
+		    using T = std::remove_cvref_t<decltype(group)>;
+		    if constexpr (requires { group.command; }) {
+			    return std::visit(
+			        [](const auto &value) -> CommandType { return std::remove_cvref_t<decltype(value)>::command_type; },
+			        group.command);
+		    } else {
+			    return std::visit(
+			        [](const auto &value) -> CommandType { return std::remove_cvref_t<decltype(value)>::command_type; },
+			        group);
+		    }
 	    },
 	    command);
 }
@@ -374,9 +415,9 @@ private:
 		result.consumed = consumed;
 		// 直接构造指定的内层 variant，避免嵌套 variant 的隐式转换歧义。
 		if constexpr (std::is_constructible_v<SingleKeyCommand, T>) {
-			result.command.emplace(std::in_place_type<SingleKeyCommand>, std::move(command));
+			result.command.emplace(std::in_place_type<SingleKeyCommand>, SingleKeyCommand(std::move(command)));
 		} else if constexpr (std::is_constructible_v<MultiKeyCommand, T>) {
-			result.command.emplace(std::in_place_type<MultiKeyCommand>, std::move(command));
+			result.command.emplace(std::in_place_type<MultiKeyCommand>, MultiKeyCommand(std::move(command)));
 		} else {
 			static_assert(std::is_constructible_v<NoKeyCommand, T>, "unsupported command type");
 			result.command.emplace(std::in_place_type<NoKeyCommand>, std::move(command));
@@ -463,21 +504,21 @@ private:
 		const std::size_t total_bytes = header_bytes + value_bytes + 2;
 
 		if (name == "set") {
-			return success(SetCommand {key, flags, exptime, value, noreply}, total_bytes);
+			return success(SetCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
 		}
 		if (name == "add") {
-			return success(AddCommand {key, flags, exptime, value, noreply}, total_bytes);
+			return success(AddCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
 		}
 		if (name == "replace") {
-			return success(ReplaceCommand {key, flags, exptime, value, noreply}, total_bytes);
+			return success(ReplaceCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
 		}
 		if (name == "append") {
-			return success(AppendCommand {key, flags, exptime, value, noreply}, total_bytes);
+			return success(AppendCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
 		}
 		if (name == "prepend") {
-			return success(PrependCommand {key, flags, exptime, value, noreply}, total_bytes);
+			return success(PrependCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
 		}
-		return success(CasCommand {key, flags, exptime, value, cas_unique, noreply}, total_bytes);
+		return success(CasCommand {ItemKey(std::string(key)), flags, exptime, value, cas_unique, noreply}, total_bytes);
 	}
 
 	OneResult parse_retrieval(std::size_t offset, std::size_t header_bytes, std::string_view name,
@@ -501,20 +542,20 @@ private:
 		// 一个 Key 时返回 Single*，且不需要创建 vector。
 		if (cursor.done()) {
 			if (name == "get") {
-				return success(SingleGetCommand {first_key}, header_bytes);
+				return success(SingleGetCommand {ItemKey(std::string(first_key))}, header_bytes);
 			}
 			if (name == "gets") {
-				return success(SingleGetsCommand {first_key}, header_bytes);
+				return success(SingleGetsCommand {ItemKey(std::string(first_key))}, header_bytes);
 			}
 			if (name == "gat") {
-				return success(SingleGatCommand {exptime, first_key}, header_bytes);
+				return success(SingleGatCommand {exptime, ItemKey(std::string(first_key))}, header_bytes);
 			}
-			return success(SingleGatsCommand {exptime, first_key}, header_bytes);
+			return success(SingleGatsCommand {exptime, ItemKey(std::string(first_key))}, header_bytes);
 		}
 
 		// 至少两个 Key 时返回 Multi*，保留原有数量和合法性检查。
-		std::vector<std::string_view> keys;
-		keys.push_back(first_key);
+		std::vector<ItemKey> keys;
+		keys.push_back(ItemKey(std::string(first_key)));
 		while (!cursor.done()) {
 			const std::string_view key = cursor.next();
 			if (!valid_key(key)) {
@@ -523,7 +564,7 @@ private:
 			if (keys.size() >= limits_.max_get_keys) {
 				return failure(ParseErrorCode::TooManyKeys, ErrorRecovery::Continue, header_bytes, offset);
 			}
-			keys.push_back(key);
+			keys.push_back(ItemKey(std::string(key)));
 		}
 
 		if (name == "get") {
@@ -591,7 +632,7 @@ private:
 			if (!parse_noreply(cursor, noreply)) {
 				return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::Continue, header_bytes, offset);
 			}
-			return success(DeleteCommand {key, noreply}, header_bytes);
+			return success(DeleteCommand {ItemKey(std::string(key)), noreply}, header_bytes);
 		}
 		if (name == "touch") {
 			const std::string_view key = cursor.next();
@@ -606,7 +647,7 @@ private:
 			if (!parse_noreply(cursor, noreply)) {
 				return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::Continue, header_bytes, offset);
 			}
-			return success(TouchCommand {key, exptime, noreply}, header_bytes);
+			return success(TouchCommand {ItemKey(std::string(key)), exptime, noreply}, header_bytes);
 		}
 		if (name == "incr" || name == "decr") {
 			const std::string_view key = cursor.next();
@@ -622,9 +663,9 @@ private:
 				return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::Continue, header_bytes, offset);
 			}
 			if (name == "incr") {
-				return success(IncrCommand {key, delta, noreply}, header_bytes);
+				return success(IncrCommand {ItemKey(std::string(key)), delta, noreply}, header_bytes);
 			}
-			return success(DecrCommand {key, delta, noreply}, header_bytes);
+			return success(DecrCommand {ItemKey(std::string(key)), delta, noreply}, header_bytes);
 		}
 		if (name == "flush_all") {
 			std::uint32_t delay = 0;
@@ -675,4 +716,4 @@ private:
 
 	ParserLimits limits_;
 };
-} // namespace protocol
+} // namespace comm

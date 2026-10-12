@@ -14,7 +14,7 @@
 #include <variant>
 #include <vector>
 
-namespace protocol {
+namespace comm {
 
 // 每种请求对应独立的 ResponseType；Error 和 NoReply 是执行/协议层的特殊结果。
 // 这里仅定义 Memcached Basic Text Protocol，不包含 Meta Text 或 Binary Protocol。

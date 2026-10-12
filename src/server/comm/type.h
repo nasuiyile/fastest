@@ -3,56 +3,40 @@
 #include "../../protocol/memcached_response.h"
 
 namespace comm {
-// Memcached value
-using Value = std::string;
-using Key = std::string;
-
-struct Item {
-	uint32_t flags {0};
-	Value value;
-};
-
-struct ItemKey {
-	uint64_t hash {0};
-	Key key;
-
-	explicit ItemKey(Key k) : hash(std::hash<Key> {}(k)), key(std::move(k)) {
-	}
-};
 
 struct MultiKeyRequest {
 	// 需要返回多少个这样的命令才可以
 	uint16_t count;
-	// 保存每个key的hash 防止二次计算
-	std::vector<uint64_t> hashes;
-	protocol::MultiKeyCommand command;
+	MultiKeyCommand command;
 };
 struct SingleKeyRequest {
-	// 保存每个key的hash 防止二次计算
-	uint64_t hash;
-	protocol::SingleKeyCommand command;
+	SingleKeyCommand command;
 };
 
-struct MultiKeyResponse {
+struct ShardResponse {
 	// 一共需要多少个
 	uint16_t count;
 	std::vector<uint64_t> hashes;
-	protocol::MultiKeyResponse command;
+	MultiKeyResponse command;
 };
-
-
 
 // 包含俩种枚举，分别是多key和单key操作
 using RequestData = std::variant<SingleKeyRequest, MultiKeyRequest>;
-using ResponseData = std::variant<protocol::SingleKeyResponse, protocol::ErrorResponse, MultiKeyResponse>;
+using ResponseData = std::variant<SingleKeyResponse, ErrorResponse, ShardResponse>;
 
-using RingResponseData = std::variant<protocol::SingleKeyResponse, protocol::ErrorResponse, std::vector<MultiKeyResponse>>;
+using RingResponseData = std::variant<SingleKeyResponse, ErrorResponse, std::vector<ShardResponse>>;
 
 struct ResponseMessage {
 	uint64_t tcp_num; // tcp编号
 	uint32_t seq;     // 请求编号，允许回绕
 	ResponseData data;
 };
+struct RingResponseMessage {
+	uint64_t tcp_num; // tcp编号
+	uint32_t seq;     // 请求编号，允许回绕
+	RingResponseData data;
+};
+
 // 负责抽象发送数据 和响应回调，每个线程都持有这样一个worker，并且可以通过worker和其他线程的mailbox来进行通信
 struct RequestMessage {
 	uint64_t tcp_id; // tcp的32位fd编号
