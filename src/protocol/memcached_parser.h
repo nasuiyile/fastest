@@ -214,6 +214,13 @@ struct MultiKeyCommand {
 	[[nodiscard]] const std::vector<ItemKey> &item_keys() const {
 		return std::visit([](const auto &value) -> const std::vector<ItemKey> & { return value.keys; }, command);
 	}
+	[[nodiscard]] CommandType command_type() const noexcept {
+		return std::visit(
+		    [](const auto &value) noexcept -> CommandType {
+			    return std::remove_cvref_t<decltype(value)>::command_type;
+		    },
+		    command);
+	}
 };
 
 // 以下命令不携带用于 hash 分片的 Key。

@@ -24,6 +24,22 @@ struct TCPSession {
 	explicit TCPSession(tcp::socket &&s) : socket(std::move(s)) {
 	}
 };
+inline MultiKeyCommand rebuild(const MultiKeyCommand &command, std::vector<ItemKey> keys) {
+	return std::visit(
+	    [&keys](const auto &value) -> MultiKeyCommand {
+		    using T = std::remove_cvref_t<decltype(value)>;
+		    if constexpr (std::is_same_v<T, MultiGetCommand>) {
+			    return MultiKeyCommand {MultiGetCommand {std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGetsCommand>) {
+			    return MultiKeyCommand {MultiGetsCommand {std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGatCommand>) {
+			    return MultiKeyCommand {MultiGatCommand {value.exptime, std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGatsCommand>) {
+			    return MultiKeyCommand {MultiGatsCommand {value.exptime, std::move(keys)}};
+		    }
+	    },
+	    command.command);
+}
 
 class Worker {
 public:
@@ -153,13 +169,17 @@ public:
 			}
 		}
 		const uint32_t seq = tcp_session_[tcp_id]->seq++;
-		for (auto key_array : multi_key_index_) {
-			if (!key_array.has_value()) {
+
+		for (size_t i = 0; i < multi_key_index_.size(); i++) {
+			if (!multi_key_index_[i].has_value()) {
 				continue;
 			}
-			auto key_views = key_array.value();
-			// MultiKeyRequest {.count = counter, .command = };
-			// RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq};
+			const auto &key_views = multi_key_index_[i].value();
+			MultiKeyCommand multi_key_command = rebuild(command, key_views);
+
+			MultiKeyRequest request = {.count = counter, .command = multi_key_command};
+			RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq, .data = RequestData {request}};
+			shard_comm_.send_request_to_shard(i, std::make_unique<RequestMessage>(request_message));
 		}
 	}
 
@@ -229,4 +249,5 @@ private:
 	std::shared_ptr<std::atomic_bool> stop_;
 	Sc shard_comm_;
 };
+
 } // namespace comm
