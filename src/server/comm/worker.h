@@ -90,7 +90,7 @@ public:
 			// 一次可以消费掉多个元素
 			while (mailbox.pop(message)) {
 				try {
-					handle_request_message(std::move(message));
+					handle_request_message(message);
 				} catch (const std::exception &e) {
 					spdlog::error("[shard {}] mailbox handler exception: {}", shard_id, e.what());
 				} catch (...) {
@@ -189,7 +189,7 @@ public:
 	}
 
 private:
-	void handle_request_message(std::unique_ptr<RequestMessage> message) {
+	void handle_request_message(const std::unique_ptr<RequestMessage> &message) {
 		auto &cmd = message->data;
 		std::visit(
 		    [&, this](const auto &c) -> awaitable<void> {

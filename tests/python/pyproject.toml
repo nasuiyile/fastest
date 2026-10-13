@@ -1,0 +1,7 @@
+[project]
+name = "memcached-test"
+version = "0.1.0"
+requires-python = "==3.13.*"
+dependencies = [
+    "pymemcache>=4.0.0"
+]
