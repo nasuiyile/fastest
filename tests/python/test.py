@@ -16,7 +16,7 @@ if value:
 else:
     print("键不存在或已过期")
 
-# 删除键
+# 删除键 未适配
 # client.delete('my_key')
 print("删除后获取:", client.get('my_key'))
 

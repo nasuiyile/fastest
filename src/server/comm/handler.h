@@ -99,8 +99,12 @@ private:
 	};
 
 	awaitable<void> session(const uint64_t tcp_id) {
-		const auto tcp_session = std::move(worker_->tcp_session_[tcp_id]);
-		tcp::socket socket = std::move(tcp_session->socket);
+		auto it = worker_->tcp_session_.find(tcp_id);
+		if (it == worker_->tcp_session_.end()) {
+			co_return;
+		}
+		TCPSession &tcp_session = *it->second;
+		tcp::socket &socket = tcp_session.socket;
 		std::size_t shard_id = worker_->current_shard_id();
 		try {
 			const MemcachedParser parser;
@@ -138,6 +142,7 @@ private:
 		} catch (...) {
 			spdlog::error("[shard {}] session unknown exception", shard_id);
 		}
+		worker_->tcp_session_.erase(tcp_id);
 	}
 
 	void run() {
@@ -192,7 +197,7 @@ private:
 			auto ptr = std::make_unique<TCPSession>(std::move(socket));
 			worker_->tcp_session_.emplace(tcp_id_++, std::move(ptr));
 			asio::co_spawn(executor, session(tcp_id_), asio::detached);
-			worker_->tcp_session_.erase(tcp_id_++);
+			// worker_->tcp_session_.erase(tcp_id_++);
 		}
 	}
 

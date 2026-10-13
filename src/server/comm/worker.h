@@ -203,30 +203,38 @@ private:
 	}
 
 	void handle_response_message(const std::unique_ptr<ResponseMessage> &message) {
-		// 写到环形数组中。如果满足回复client的条件，获得对应的TCP socket，写入TCP socket。
-		auto ring_array = tcp_session_[message->tcp_id]->ring_array;
+		auto it = tcp_session_.find(message->tcp_id);
+		if (it == tcp_session_.end() || !it->second) {
+			return;
+		}
+
+		auto &session = *it->second;
+		auto &ring_array = session.ring_array;
+		auto &socket = session.socket;
+
 		ring_array.append(*message);
+
 		while (ring_array.is_ready()) {
-			std::optional<ResponseMessage> response_message = ring_array.try_pop();
+			auto response_message = ring_array.try_pop();
 			if (!response_message.has_value()) {
 				return;
 			}
-			ResponseMessage &msg = *response_message;
-			// 真正写入TCP中
-			const std::unique_ptr<TCPSession> tcp_session = std::move(tcp_session_[msg.tcp_id]);
-			auto socket = std::move(tcp_session->socket);
+
+			auto &msg = *response_message;
+
 			std::visit(
-			    [&socket](const auto &value) {
-				    using T = std::remove_cvref_t<decltype(value)>;
-				    if constexpr (std::is_same_v<T, SingleKeyResponse>) {
-					    value.send_to(socket);
-				    } else if constexpr (std::is_same_v<T, ErrorResponse>) {
-					    value.send_to(socket);
-				    } else if constexpr (std::is_same_v<T, ShardResponse>) {
-					    value.command.send_to(socket);
-				    }
-			    },
-			    msg.data);
+				[&socket](const auto &value) {
+					using T = std::remove_cvref_t<decltype(value)>;
+
+					if constexpr (std::is_same_v<T, SingleKeyResponse>) {
+						value.send_to(socket);
+					} else if constexpr (std::is_same_v<T, ErrorResponse>) {
+						value.send_to(socket);
+					} else if constexpr (std::is_same_v<T, ShardResponse>) {
+						value.command.send_to(socket);
+					}
+				},
+				msg.data);
 		}
 	}
 	ShardCache data_;
