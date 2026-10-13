@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -31,7 +32,7 @@ public:
 	}
 
 	// 按值接收；调用方使用 append(std::move(message))，避免复制响应内容。
-	// count 是该请求预期收到的分片回复总数；每个分片必须且只能回复一次，未命中也要回复。
+	// count 是预期的分片回复总数；每个分片必须且只能回复一次，未命中也要回复。
 	void append(ResponseMessage message) {
 		const auto distance = static_cast<std::uint32_t>(message.seq - next_id_);
 		if (distance >= kHalfRange) {
@@ -51,11 +52,11 @@ public:
 				    using T = std::remove_cvref_t<decltype(response)>;
 				    if constexpr (std::is_same_v<T, ShardResponse>) {
 					    MultiResponses responses;
-					    responses.reserve(response.count); // 只预留空间，size 仍为 0。
+					    responses.reserve(response.count);
 					    responses.emplace_back(std::move(response));
-					    slot.emplace(message.tcp_num, message.seq, std::move(responses));
+					    slot.emplace(message.tcp_id, message.seq, std::move(responses));
 				    } else {
-					    slot.emplace(message.tcp_num, message.seq, std::move(response));
+					    slot.emplace(message.tcp_id, message.seq, std::move(response));
 				    }
 			    },
 			    message.data);
@@ -65,7 +66,7 @@ public:
 		if (slot->seq != message.seq) {
 			throw std::logic_error("RingArray slot collision");
 		}
-		if (slot->tcp_num != message.tcp_num) {
+		if (slot->tcp_id != message.tcp_id) {
 			throw std::logic_error("RingArray TCP identifier mismatch");
 		}
 
@@ -83,11 +84,14 @@ public:
 			if (incoming->count != expected) {
 				throw std::logic_error("Inconsistent ShardResponse count");
 			}
-			responses->emplace_back(std::move(*incoming)); // 已 reserve，不会触发 vector 扩容。
+			if (incoming->command.index() != responses->front().command.index()) {
+				throw std::logic_error("Inconsistent multi-key response type");
+			}
+			responses->emplace_back(std::move(*incoming));
 			return;
 		}
 
-		// 错误作为整个请求的终态；丢弃已收集的部分结果，后续迟到回复会被忽略。
+		// 错误作为整个请求的终态；丢弃部分结果，忽略后续迟到回复。
 		if (auto *error = std::get_if<ErrorResponse>(&message.data)) {
 			slot->data.emplace<ErrorResponse>(std::move(*error));
 			return;
@@ -95,7 +99,7 @@ public:
 		throw std::logic_error("Single-key response received for an incomplete multi-key request");
 	}
 
-	// get() 可以查看尚未收齐的槽位；不得通过返回的指针修改 seq、count 或聚合容器。
+	// get() 可以查看尚未收齐的槽位；不得修改 seq、count、响应类型或聚合容器。
 	[[nodiscard]] RingResponseMessage *get(std::uint32_t index) noexcept {
 		return const_cast<RingResponseMessage *>(std::as_const(*this).get(index));
 	}
@@ -123,20 +127,37 @@ public:
 	[[nodiscard]] std::uint32_t next_id() const noexcept {
 		return next_id_;
 	}
+
 	[[nodiscard]] std::size_t capacity() const noexcept {
 		return ring_.size();
 	}
+
 	[[nodiscard]] bool is_ready() const noexcept {
 		return front() != nullptr;
 	}
 
-	// 只弹出已就绪的队首；缺失或未收齐时，不清空槽位，也不推进序号。
-	[[nodiscard]] std::optional<RingResponseMessage> try_pop() noexcept {
+	// 返回 ResponseMessage；多分片数据合并为一个 ShardResponse，count = 1。
+	// 缺失或未收齐时返回 nullopt；聚合失败时保留槽位和 next_id_，可重试。
+	// 聚合可能分配内存，因此这里不能使用 noexcept。
+	[[nodiscard]] std::optional<ResponseMessage> try_pop() {
 		auto &slot = ring_[position(next_id_)];
 		if (!slot || slot->seq != next_id_ || !ready(*slot)) {
 			return std::nullopt;
 		}
-		std::optional<RingResponseMessage> result(std::in_place, std::move(*slot));
+
+		std::optional<ResponseMessage> result;
+		std::visit(
+		    [&](auto &response) {
+			    using T = std::remove_cvref_t<decltype(response)>;
+			    if constexpr (std::is_same_v<T, MultiResponses>) {
+				    result.emplace(slot->tcp_id, slot->seq,
+				                   ResponseData(std::in_place_type<ShardResponse>, merge_shards(response)));
+			    } else {
+				    result.emplace(slot->tcp_id, slot->seq, ResponseData(std::in_place_type<T>, std::move(response)));
+			    }
+		    },
+		    slot->data);
+
 		slot.reset();
 		++next_id_;
 		return result;
@@ -146,6 +167,41 @@ private:
 	[[nodiscard]] static bool ready(const RingResponseMessage &message) noexcept {
 		const auto *responses = std::get_if<MultiResponses>(&message.data);
 		return !responses || (!responses->empty() && responses->size() == responses->front().count);
+	}
+
+	// 复用首个分片的 vector；先检查类型和总长度，再一次性 reserve，最后移动条目。
+	// 合并顺序是分片到达顺序，各分片内部的条目顺序保持不变。
+	[[nodiscard]] static ShardResponse merge_shards(MultiResponses &responses) {
+		return std::visit(
+		    [&](auto &first) -> ShardResponse {
+			    using T = std::remove_cvref_t<decltype(first)>;
+			    using Item = typename std::remove_cvref_t<decltype(first.items)>::value_type;
+			    static_assert(std::is_nothrow_move_constructible_v<Item>, "Response items must be nothrow movable");
+
+			    std::size_t total = first.items.size();
+			    for (std::size_t i = 1; i < responses.size(); ++i) {
+				    const auto *part = std::get_if<T>(&responses[i].command.variant());
+				    if (!part) {
+					    throw std::logic_error("Inconsistent multi-key response type");
+				    }
+				    if (part->items.size() > first.items.max_size() - total) {
+					    throw std::length_error("Merged response exceeds vector max_size");
+				    }
+				    total += part->items.size();
+			    }
+
+			    // reserve 失败时尚未移动条目，原始分片数据保持完整。
+			    first.items.reserve(total);
+			    for (std::size_t i = 1; i < responses.size(); ++i) {
+				    auto &part = std::get<T>(responses[i].command.variant());
+				    for (auto &item : part.items) {
+					    first.items.emplace_back(std::move(item));
+				    }
+			    }
+
+			    return ShardResponse {1, std::move(responses.front().command)};
+		    },
+		    responses.front().command.variant());
 	}
 
 	[[nodiscard]] std::size_t position(std::uint32_t seq) const noexcept {

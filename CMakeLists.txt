@@ -23,7 +23,6 @@ add_executable(fastest
         src/protocol/memcahed_request.h
         src/server/fastest_server.h
         src/cache/core_cache.h
-        src/cache/core_cache.cpp
         src/server/config.h
         src/util/hardware_info.h
         src/server/mailbox.h
@@ -41,6 +40,7 @@ add_executable(fastest
         src/protocol/memcached_parser.h
         src/protocol/memcached_response.h
         src/protocol/memcached_response.h
+        src/cache/shard_cache.h
 )
 
 target_link_libraries(fastest

@@ -66,8 +66,8 @@ public:
 		return shard_id_;
 	}
 
-	[[nodiscard]] bool is_current_shard(const std::size_t hash) const {
-		return get_shard(hash) == shard_id_;
+	[[nodiscard]] bool is_current_shard(const std::size_t shard_id) const {
+		return shard_id == shard_id_;
 	}
 
 	bool send_request_to_shard(std::size_t shard_id, std::unique_ptr<Request> message) {

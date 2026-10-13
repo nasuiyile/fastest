@@ -8,6 +8,7 @@
 #include "shard.h"
 #include "type.h"
 #include "../../protocol/memcached_parser.h"
+#include "../../cache/shard_cache.h"
 
 namespace comm {
 namespace asio = boost::asio;
@@ -19,7 +20,7 @@ using asio::ip::tcp;
 struct TCPSession {
 	tcp::socket socket;
 	RingArray ring_array;
-	uint32_t seq{0};
+	uint32_t seq {0};
 
 	explicit TCPSession(tcp::socket &&s) : socket(std::move(s)) {
 	}
@@ -27,28 +28,28 @@ struct TCPSession {
 
 inline MultiKeyCommand rebuild(const MultiKeyCommand &command, std::vector<ItemKey> keys) {
 	return std::visit(
-		[&keys](const auto &value) -> MultiKeyCommand {
-			using T = std::remove_cvref_t<decltype(value)>;
-			if constexpr (std::is_same_v<T, MultiGetCommand>) {
-				return MultiKeyCommand{MultiGetCommand{std::move(keys)}};
-			} else if constexpr (std::is_same_v<T, MultiGetsCommand>) {
-				return MultiKeyCommand{MultiGetsCommand{std::move(keys)}};
-			} else if constexpr (std::is_same_v<T, MultiGatCommand>) {
-				return MultiKeyCommand{MultiGatCommand{value.exptime, std::move(keys)}};
-			} else if constexpr (std::is_same_v<T, MultiGatsCommand>) {
-				return MultiKeyCommand{MultiGatsCommand{value.exptime, std::move(keys)}};
-			}
-		},
-		command.command);
+	    [&keys](const auto &value) -> MultiKeyCommand {
+		    using T = std::remove_cvref_t<decltype(value)>;
+		    if constexpr (std::is_same_v<T, MultiGetCommand>) {
+			    return MultiKeyCommand {MultiGetCommand {std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGetsCommand>) {
+			    return MultiKeyCommand {MultiGetsCommand {std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGatCommand>) {
+			    return MultiKeyCommand {MultiGatCommand {value.exptime, std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGatsCommand>) {
+			    return MultiKeyCommand {MultiGatsCommand {value.exptime, std::move(keys)}};
+		    }
+	    },
+	    command.command);
 }
 
 class Worker {
 public:
-	std::unordered_map<uint64_t, std::unique_ptr<TCPSession> > tcp_session_;
+	std::unordered_map<uint64_t, std::unique_ptr<TCPSession>> tcp_session_;
 	using Sc = ShardComm<RequestMessage, ResponseMessage>;
 
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
-		: stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
+	    : stop_(std::move(stop)), shard_comm_(std::move(shard_comm)) {
 	}
 
 	static std::vector<Worker> create_workers(const std::size_t core_num,
@@ -62,7 +63,6 @@ public:
 		}
 		return workers;
 	}
-
 
 	// 接收他人请求
 	awaitable<void> mailbox_request_loop() {
@@ -127,7 +127,7 @@ public:
 			// 一次可以消费掉多个元素
 			while (mailbox.pop(message)) {
 				try {
-					handle_response_message(std::move(message));
+					handle_response_message(message);
 				} catch (const std::exception &e) {
 					spdlog::error("[shard {}] mailbox handler exception: {}", shard_id, e.what());
 				} catch (...) {
@@ -142,7 +142,6 @@ public:
 		return shard_comm_.current_shard_id();
 	}
 
-
 	void send_multi_command(MultiKeyCommand &command, const uint64_t tcp_id) {
 		const std::vector<ItemKey> &item_keys = command.item_keys();
 		uint16_t counter = 0;
@@ -150,7 +149,7 @@ public:
 			std::size_t shard = shard_comm_.get_shard(item_keys[i].hash);
 			if (!multi_key_index_[shard].has_value()) {
 				counter++;
-				multi_key_index_[shard] = std::vector<ItemKey>{item_keys[i]};
+				multi_key_index_[shard] = std::vector<ItemKey> {item_keys[i]};
 			} else {
 				multi_key_index_[shard].value().emplace_back(item_keys[i]);
 			}
@@ -163,9 +162,13 @@ public:
 			}
 			const auto &key_views = multi_key_index_[i].value();
 			MultiKeyCommand multi_key_command = rebuild(command, key_views);
-
+			if (shard_comm_.is_current_shard(i)) {
+				// 如果是当前分片，那么就直接处理
+				data_.handle_multi_command(multi_key_command);
+				multi_key_index_[i].reset();
+			}
 			MultiKeyRequest request = {.count = counter, .command = multi_key_command};
-			RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq, .data = RequestData{request}};
+			RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq, .data = RequestData {request}};
 			shard_comm_.send_request_to_shard(i, std::make_unique<RequestMessage>(request_message));
 			multi_key_index_[i].reset();
 		}
@@ -174,102 +177,61 @@ public:
 	void send_single_command(SingleKeyCommand &command, const uint64_t tcp_id) {
 		SingleKeyRequest request = {.command = command};
 		const std::size_t shard = shard_comm_.get_shard(command.item_key().hash);
-		RequestMessage request_message = {
-			.tcp_id = tcp_id, .seq = tcp_session_[tcp_id]->seq++, .data = RequestData{request}};
+		auto seq = tcp_session_[tcp_id]->seq++;
+		if (shard_comm_.is_current_shard(shard)) {
+			SingleKeyResponse handle_single_command = data_.handle_single_command(command);
+			ResponseMessage response = {.tcp_id = tcp_id, .seq = seq, .data = ResponseData {handle_single_command}};
+			handle_response_message(std::make_unique<ResponseMessage>(response));
+			return;
+		}
+		RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq, .data = RequestData {request}};
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
 	}
 
 private:
-	[[nodiscard]] bool is_current_shard(const std::size_t hash) const {
-		return shard_comm_.is_current_shard(hash);
-	}
-
-	SingleKeyResponse handle_single_get_command(const SingleGetCommand &command) {
-		if (auto it = data_.find(command.key); it != data_.end()) {
-			Item val = it->second;
-			SingleGetResponse{.item = ValueItem{
-				.key = command.key.key,
-				.flags = val.flags,
-				.value = val.value
-			}};
-		} else {
-			SingleGetResponse{.item = };
-		}
-	}
-
-	MultiKeyResponse handle_multi_command(const MultiKeyCommand &command) {
-		return std::visit(
-			[&command](const auto &value) -> MultiKeyResponse {
-				using T = std::remove_cvref_t<decltype(value)>;
-				if constexpr (std::is_same_v<T, SetCommand>) {
-				} else if constexpr (std::is_same_v<T, MultiGetCommand>) {
-				} else if constexpr (std::is_same_v<T, MultiGetsCommand>) {
-				} else if constexpr (std::is_same_v<T, MultiGatCommand>) {
-				} else if constexpr (std::is_same_v<T, MultiGatsCommand>) {
-				}
-			},
-			command.command);
-	}
-
-	SingleKeyResponse handle_single_command(const SingleKeyCommand &command) {
-		return std::visit(
-			[&command](const auto &value) -> SingleKeyResponse {
-				using T = std::remove_cvref_t<decltype(value)>;
-				if constexpr (std::is_same_v<T, SetCommand>) {
-				} else if constexpr (std::is_same_v<T, AddCommand>) {
-				} else if constexpr (std::is_same_v<T, ReplaceCommand>) {
-				} else if constexpr (std::is_same_v<T, AppendCommand>) {
-				} else if constexpr (std::is_same_v<T, PrependCommand>) {
-				} else if constexpr (std::is_same_v<T, CasCommand>) {
-				} else if constexpr (std::is_same_v<T, SingleGetCommand>) {
-				} else if constexpr (std::is_same_v<T, SingleGetsCommand>) {
-				} else if constexpr (std::is_same_v<T, SingleGatCommand>) {
-				} else if constexpr (std::is_same_v<T, SingleGatsCommand>) {
-				} else if constexpr (std::is_same_v<T, DeleteCommand>) {
-				} else if constexpr (std::is_same_v<T, TouchCommand>) {
-				} else if constexpr (std::is_same_v<T, IncrCommand>) {
-				} else if constexpr (std::is_same_v<T, DecrCommand>) {
-				}
-			},
-			command.command);
-	}
-
-	void set(const ItemKey &key, const Item &item) {
-		data_[key] = item;
-	}
-
-
 	void handle_request_message(std::unique_ptr<RequestMessage> message) {
 		auto &cmd = message->data;
 		std::visit(
-			[&, this](const auto &c) -> awaitable<void> {
-				using T = std::decay_t<decltype(c)>;
-				if constexpr (std::is_same_v<T, SingleKeyRequest>) {
-					handle_single_command(c.command);
-				} else if constexpr (std::is_same_v<T, MultiKeyRequest>)
-					handle_multi_command(c.command);
-			},
-			cmd);
+		    [&, this](const auto &c) -> awaitable<void> {
+			    using T = std::decay_t<decltype(c)>;
+			    if constexpr (std::is_same_v<T, SingleKeyRequest>) {
+				    data_.handle_single_command(c.command);
+			    } else if constexpr (std::is_same_v<T, MultiKeyRequest>)
+				    data_.handle_multi_command(c.command);
+		    },
+		    cmd);
 	}
 
 	void handle_response_message(const std::unique_ptr<ResponseMessage> &message) {
 		// 写到环形数组中。如果满足回复client的条件，获得对应的TCP socket，写入TCP socket。
-		auto ring_array = tcp_session_[message->tcp_num]->ring_array;
+		auto ring_array = tcp_session_[message->tcp_id]->ring_array;
 		ring_array.append(*message);
 		while (ring_array.is_ready()) {
-			std::optional<RingResponseMessage> response_message = ring_array.try_pop();
+			std::optional<ResponseMessage> response_message = ring_array.try_pop();
 			if (!response_message.has_value()) {
 				return;
 			}
-
-			RingResponseMessage &msg = *response_message;
+			ResponseMessage &msg = *response_message;
 			// 真正写入TCP中
+			const std::unique_ptr<TCPSession> tcp_session = std::move(tcp_session_[msg.tcp_id]);
+			auto socket = std::move(tcp_session->socket);
+			std::visit(
+			    [&socket](const auto &value) {
+				    using T = std::remove_cvref_t<decltype(value)>;
+				    if constexpr (std::is_same_v<T, SingleKeyResponse>) {
+					    value.send_to(socket);
+				    } else if constexpr (std::is_same_v<T, ErrorResponse>) {
+					    value.send_to(socket);
+				    } else if constexpr (std::is_same_v<T, ShardResponse>) {
+					    value.command.send_to(socket);
+				    }
+			    },
+			    msg.data);
 		}
 	}
-
-	std::unordered_map<ItemKey, Item, KeyHash, KeyEqual> data_;
+	ShardCache data_;
 	// 长度和CPU核心数一样
-	std::vector<std::optional<std::vector<ItemKey> > > multi_key_index_;
+	std::vector<std::optional<std::vector<ItemKey>>> multi_key_index_;
 	std::shared_ptr<std::atomic_bool> stop_;
 	Sc shard_comm_;
 };

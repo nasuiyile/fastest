@@ -16,7 +16,6 @@ struct SingleKeyRequest {
 struct ShardResponse {
 	// 一共需要多少个
 	uint16_t count;
-	std::vector<uint64_t> hashes;
 	MultiKeyResponse command;
 };
 
@@ -27,13 +26,13 @@ using ResponseData = std::variant<SingleKeyResponse, ErrorResponse, ShardRespons
 using RingResponseData = std::variant<SingleKeyResponse, ErrorResponse, std::vector<ShardResponse>>;
 
 struct ResponseMessage {
-	uint64_t tcp_num; // tcp编号
-	uint32_t seq;     // 请求编号，允许回绕
+	uint64_t tcp_id; // tcp编号
+	uint32_t seq;    // 请求编号，允许回绕
 	ResponseData data;
 };
 struct RingResponseMessage {
-	uint64_t tcp_num; // tcp编号
-	uint32_t seq;     // 请求编号，允许回绕
+	uint64_t tcp_id; // tcp编号
+	uint32_t seq;    // 请求编号，允许回绕
 	RingResponseData data;
 };
 
