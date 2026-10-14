@@ -168,7 +168,9 @@ public:
 				multi_key_index_[i].reset();
 			}
 			MultiKeyRequest request = {.count = counter, .command = multi_key_command};
-			RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq, .data = RequestData{request}};
+			RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq,
+			                                  .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+			                                  .data = RequestData{request}};
 			shard_comm_.send_request_to_shard(i, std::make_unique<RequestMessage>(request_message));
 			multi_key_index_[i].reset();
 		}
@@ -180,11 +182,15 @@ public:
 		auto seq = tcp_session_[tcp_id]->seq++;
 		if (shard_comm_.is_current_shard(shard)) {
 			SingleKeyResponse handle_single_command = data_.handle_single_command(command);
-			ResponseMessage response = {.tcp_id = tcp_id, .seq = seq, .data = ResponseData{handle_single_command}};
+			ResponseMessage response = {.tcp_id = tcp_id, .seq = seq,
+			                            .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+			                            .data = ResponseData{handle_single_command}};
 			handle_response_message(std::make_unique<ResponseMessage>(response));
 			return;
 		}
-		RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq, .data = RequestData{request}};
+		RequestMessage request_message = {.tcp_id = tcp_id, .seq = seq,
+		                                  .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+		                                  .data = RequestData{request}};
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
 	}
 
@@ -202,9 +208,11 @@ private:
 				}
 			},
 			cmd);
+		// 响应发回请求的发送方；响应里的 shard_id 填自己（响应的发送方）
 		ResponseMessage response_message = {.tcp_id = message->tcp_id, .seq = message->seq,
-		                                    .shard_id = message->shard_id, .data = std::move(res)};
-		shard_comm_.send_response_shard(response_message.shard_id,
+		                                    .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+		                                    .data = std::move(res)};
+		shard_comm_.send_response_shard(message->shard_id,
 		                                std::make_unique<ResponseMessage>(std::move(response_message)));
 	}
 

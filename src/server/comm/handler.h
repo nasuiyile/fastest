@@ -195,9 +195,9 @@ private:
 				continue;
 			}
 			auto ptr = std::make_unique<TCPSession>(std::move(socket));
-			worker_->tcp_session_.emplace(tcp_id_++, std::move(ptr));
-			asio::co_spawn(executor, session(tcp_id_), asio::detached);
-			// worker_->tcp_session_.erase(tcp_id_++);
+			uint64_t id = tcp_id_++;
+			worker_->tcp_session_.emplace(id, std::move(ptr));
+			asio::co_spawn(executor, session(id), asio::detached);
 		}
 	}
 

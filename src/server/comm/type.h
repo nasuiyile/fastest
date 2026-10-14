@@ -28,7 +28,7 @@ using RingResponseData = std::variant<SingleKeyResponse, ErrorResponse, std::vec
 struct ResponseMessage {
 	uint64_t tcp_id; // tcp编号
 	uint32_t seq;    // 请求编号，允许回绕
-	uint16_t shard_id;
+	uint16_t shard_id; // 发送这条响应的分片
 	ResponseData data;
 };
 
@@ -42,7 +42,7 @@ struct RingResponseMessage {
 struct RequestMessage {
 	uint64_t tcp_id; // tcp的32位fd编号
 	uint32_t seq;    // 请求编号，允许回绕
-	uint16_t shard_id;
+	uint16_t shard_id; // 发送这条请求的分片，响应会发回这里
 	RequestData data;
 };
 
