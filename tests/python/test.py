@@ -27,5 +27,13 @@ if value2:
     print(f"获取到的值: {value2}")
 else:
     print("键不存在或已过期")
-# 关闭连接
-# client.close()
+
+try:
+    # 故意在键名中插入空格，触发 CLIENT_ERROR
+    client.raw_command(b"get my_key extra_token")
+except Exception as e:
+    print(f"触发 CLIENT_ERROR: {e}")
+
+# 验证连接是否仍然可用
+client.set('test_after_error', 'still works')
+print(client.get('test_after_error'))  # 应该能正常返回

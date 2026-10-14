@@ -197,6 +197,15 @@ public:
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
 	}
 
+	void send_error_command(ErrorResponse &response, const uint64_t tcp_id) {
+		const uint32_t seq = tcp_session_[tcp_id]->seq++;
+		handle_response_message(std::make_unique<ResponseMessage>(
+		    ResponseMessage {.tcp_id = tcp_id,
+		                     .seq = seq,
+		                     .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+		                     .data = {response}}));
+	}
+
 private:
 	void handle_request_message(const std::unique_ptr<RequestMessage> &message) {
 		auto &cmd = message->data;
@@ -226,8 +235,7 @@ private:
 			return;
 		auto &session = *it->second;
 		if (session.closing)
-			return; // 丢弃迟到响应
-
+			return;                                     // 丢弃迟到响应
 		session.ring_array.append(std::move(*message)); // 顺便省一次拷贝
 		while (!session.closing) {
 			auto popped = session.ring_array.try_pop();

@@ -7,11 +7,11 @@
 #include <boost/asio.hpp>
 #include <spdlog/spdlog.h>
 #include <atomic>
+#include <sys/socket.h>
 #include "worker.h"
-#include "../../protocol/memcached_parser.h"
 #include "type.h"
 #include "../../util/hardware_info.h"
-#include <sys/socket.h>
+#include "../../protocol/memcached_parser.h"
 
 namespace fastest {
 using asio::awaitable;
@@ -24,15 +24,15 @@ public:
 		thread_ = std::thread([this] { run(); });
 	}
 
-	static std::vector<std::unique_ptr<Handler> > create_handlers(const Config &cfg) {
+	static std::vector<std::unique_ptr<Handler>> create_handlers(const Config &cfg) {
 		const std::size_t core_num = util::core_num();
 		const auto stop = std::make_shared<std::atomic_bool>(false);
 		auto workers = Worker::create_workers(core_num, stop);
-		std::vector<std::unique_ptr<Handler> > handlers;
+		std::vector<std::unique_ptr<Handler>> handlers;
 		handlers.reserve(workers.size());
 		for (auto &worker : workers) {
 			handlers.push_back(
-				std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
+			    std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
 		}
 		return handlers;
 	}
@@ -45,17 +45,13 @@ public:
 
 private:
 	explicit Handler(Config config, std::unique_ptr<Worker> worker, std::shared_ptr<std::atomic_bool> stop)
-		: config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
+	    : config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
 	}
 
 	// 最大读取命令行的限制，命令行是\r\n结尾的
 	static constexpr std::size_t kMaxCommandLineBytes = 8 * 1024;
 	// 单次最多读取字节数
 	static constexpr std::size_t kReadChunkBytes = 4096;
-
-	static awaitable<void> write_text(tcp::socket &socket, const std::string_view text) {
-		co_await asio::async_write(socket, asio::buffer(text.data(), text.size()), use_awaitable);
-	}
 
 	static std::string_view parse_error_message(ParseErrorCode code) noexcept {
 		using enum ParseErrorCode;
@@ -75,25 +71,27 @@ private:
 		}
 	}
 
-	static awaitable<bool> handle_parse_error(tcp::socket &socket, const ParseError &error) {
-		co_await write_text(socket, parse_error_message(error.code));
+	awaitable<bool> handle_parse_error(const uint64_t tcp_id, const ParseError &error) const {
+		// co_await write_text(socket, parse_error_message(error.code));
+		ErrorResponse error_response = to_error_response(error);
+		worker_->send_error_command(error_response, tcp_id);
 		co_return error.recovery == ErrorRecovery::Continue;
 	}
 
 	void execute_batch(const std::vector<Command> &vector, uint64_t tcp_id) {
 		for (Command variant : vector) {
 			std::visit(
-				[this, tcp_id](auto &&arg) {
-					using T = std::decay_t<decltype(arg)>;
-					if constexpr (std::is_same_v<T, SingleKeyCommand>) {
-						worker_->send_single_command(arg, tcp_id);
-					} else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
-						worker_->send_multi_command(arg, tcp_id);
-					} else if constexpr (std::is_same_v<T, NoKeyCommand>) {
-						// ...
-					}
-				},
-				variant);
+			    [this, tcp_id](auto &&arg) {
+				    using T = std::decay_t<decltype(arg)>;
+				    if constexpr (std::is_same_v<T, SingleKeyCommand>) {
+					    worker_->send_single_command(arg, tcp_id);
+				    } else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
+					    worker_->send_multi_command(arg, tcp_id);
+				    } else if constexpr (std::is_same_v<T, NoKeyCommand>) {
+					    // ...
+				    }
+			    },
+			    variant);
 		}
 	};
 
@@ -109,14 +107,14 @@ private:
 			const MemcachedParser parser;
 			// 保留上一次没有解析完的数据
 			std::string input;
-			std::array<char, 4096> recv_buffer{};
+			std::array<char, 4096> recv_buffer {};
 			while (!stop_->load(std::memory_order_relaxed)) {
 				auto result = parser.parse(std::span(input.data(), input.size()), 128);
 				// 先执行成功解析的命令，确保响应顺序正确
 				execute_batch(result.commands, tcp_id);
 				bool keep_connection = true;
 				if (result.stop == StopReason::Error) {
-					keep_connection = co_await handle_parse_error(socket, *result.error);
+					keep_connection = co_await handle_parse_error(tcp_id, *result.error);
 				}
 				// 所有 CommandView 使用完毕后才能消费
 				input.erase(0, result.consumed);
@@ -201,7 +199,7 @@ private:
 	}
 
 	// 每次收到TCP都分配一个新版本号
-	uint64_t tcp_id_{0};
+	uint64_t tcp_id_ {0};
 
 	std::thread thread_;
 
@@ -213,4 +211,4 @@ private:
 
 	std::shared_ptr<std::atomic_bool> stop_;
 };
-} // namespace comm
+} // namespace fastest

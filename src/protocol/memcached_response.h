@@ -1,5 +1,6 @@
 #pragma once
 
+#include "memcached_parser.h"
 #include <array>
 #include <charconv>
 #include <cstddef>
@@ -179,6 +180,50 @@ struct ErrorResponse {
 	// 错误响应是 Response 的独立分支，也支持直接发送；复用统一的协议编码及固定容量发送器。
 	[[nodiscard]] SendResult send_to(boost::asio::ip::tcp::socket &socket) const;
 };
+
+// 将解析错误转换为可直接 send_to(socket) 或放入 ResponseBatch 的响应。
+// 未知命令使用协议规定的 ERROR（不携带消息）；其他错误使用 CLIENT_ERROR。
+[[nodiscard]] inline ErrorResponse to_error_response(const ParseError &error) {
+	ErrorResponse response;
+	response.kind = ResponseErrorKind::ClientError;
+	response.close_connection = error.recovery == ErrorRecovery::CloseConnection;
+	switch (error.code) {
+	case ParseErrorCode::UnknownCommand:
+		response.kind = ResponseErrorKind::Error;
+		response.message = "unknown command";
+		break;
+	case ParseErrorCode::BadCommandLine:
+		response.message = "bad command line format";
+		break;
+	case ParseErrorCode::InvalidKey:
+		response.message = "invalid key";
+		break;
+	case ParseErrorCode::InvalidNumber:
+		response.message = "invalid numeric argument";
+		break;
+	case ParseErrorCode::ValueTooLarge:
+		response.message = "object too large for cache";
+		break;
+	case ParseErrorCode::BadDataChunk:
+		response.message = "bad data chunk";
+		break;
+	case ParseErrorCode::TooManyKeys:
+		response.message = "too many keys";
+		break;
+	case ParseErrorCode::CommandLineTooLong:
+		response.message = "command line too long";
+		break;
+	case ParseErrorCode::InvalidLineEnding:
+		response.message = "invalid line ending";
+		break;
+	default:
+		response.kind = ResponseErrorKind::ServerError;
+		response.message = "unknown parse error code";
+		response.close_connection = true;
+		break;
+	}
+	return response;
+}
 
 struct NoReplyResponse {
 	static constexpr ResponseType response_type = ResponseType::NoReply;
