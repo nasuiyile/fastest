@@ -14,7 +14,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
@@ -46,7 +45,7 @@ enum class ResponseType : std::uint8_t {
 	NoReply
 };
 
-enum class StorageStatus : std::uint8_t { Stored, NotStored };
+enum class StorageStatus : std::uint8_t { Stored, NotStored, NoReply };
 
 template <ResponseType Type>
 struct StorageResponseT {
@@ -60,7 +59,7 @@ using ReplaceResponse = StorageResponseT<ResponseType::Replace>;
 using AppendResponse = StorageResponseT<ResponseType::Append>;
 using PrependResponse = StorageResponseT<ResponseType::Prepend>;
 
-enum class CasStatus : std::uint8_t { Stored, Exists, NotFound };
+enum class CasStatus : std::uint8_t { Stored, Exists, NotFound, NoReply };
 
 struct CasResponse {
 	static constexpr ResponseType response_type = ResponseType::Cas;
@@ -103,35 +102,43 @@ using MultiGetsResponse = MultiRetrievalResponseT<ResponseType::Gets, CasValueIt
 using MultiGatResponse = MultiRetrievalResponseT<ResponseType::Gat, ValueItem>;
 using MultiGatsResponse = MultiRetrievalResponseT<ResponseType::Gats, CasValueItem>;
 
-enum class DeleteStatus : std::uint8_t { Deleted, NotFound };
+enum class DeleteStatus : std::uint8_t { Deleted, NotFound, NoReply };
 
 struct DeleteResponse {
 	static constexpr ResponseType response_type = ResponseType::Delete;
 	DeleteStatus status = DeleteStatus::Deleted;
 };
 
-enum class TouchStatus : std::uint8_t { Touched, NotFound };
+enum class TouchStatus : std::uint8_t { Touched, NotFound, NoReply };
 
 struct TouchResponse {
 	static constexpr ResponseType response_type = ResponseType::Touch;
 	TouchStatus status = TouchStatus::Touched;
 };
 
+// Reply 时 value 有值输出数值，无值输出 NOT_FOUND；NoReply 时忽略 value。
+enum class ArithmeticStatus : std::uint8_t { Reply, NoReply };
+
 template <ResponseType Type>
 struct ArithmeticResponseT {
 	static constexpr ResponseType response_type = Type;
 	std::optional<std::uint64_t> value;
+	ArithmeticStatus status = ArithmeticStatus::Reply;
 };
 
 using IncrResponse = ArithmeticResponseT<ResponseType::Incr>;
 using DecrResponse = ArithmeticResponseT<ResponseType::Decr>;
 
+enum class OkStatus : std::uint8_t { Ok, NoReply };
+
 struct FlushAllResponse {
 	static constexpr ResponseType response_type = ResponseType::FlushAll;
+	OkStatus status = OkStatus::Ok;
 };
 
 struct VerbosityResponse {
 	static constexpr ResponseType response_type = ResponseType::Verbosity;
+	OkStatus status = OkStatus::Ok;
 };
 
 enum class StatsLineType : std::uint8_t { Stat, Item, Prefix };
@@ -179,6 +186,7 @@ struct NoReplyResponse {
 
 struct SendResult {
 	std::size_t bytes_sent = 0;
+	// 已处理的响应对象数，包含 NoReply 和 Quit，不等于实际输出的协议响应数。
 	std::size_t responses_sent = 0;
 	bool close_connection = false;
 };
@@ -425,6 +433,8 @@ inline std::string_view storage_text(StorageStatus status) {
 		return "STORED\r\n";
 	case StorageStatus::NotStored:
 		return "NOT_STORED\r\n";
+	case StorageStatus::NoReply:
+		return {};
 	default:
 		throw std::invalid_argument("invalid storage response status");
 	}
@@ -438,6 +448,8 @@ inline std::string_view cas_text(CasStatus status) {
 		return "EXISTS\r\n";
 	case CasStatus::NotFound:
 		return "NOT_FOUND\r\n";
+	case CasStatus::NoReply:
+		return {};
 	default:
 		throw std::invalid_argument("invalid cas response status");
 	}
@@ -449,6 +461,8 @@ inline std::string_view delete_text(DeleteStatus status) {
 		return "DELETED\r\n";
 	case DeleteStatus::NotFound:
 		return "NOT_FOUND\r\n";
+	case DeleteStatus::NoReply:
+		return {};
 	default:
 		throw std::invalid_argument("invalid delete response status");
 	}
@@ -460,8 +474,21 @@ inline std::string_view touch_text(TouchStatus status) {
 		return "TOUCHED\r\n";
 	case TouchStatus::NotFound:
 		return "NOT_FOUND\r\n";
+	case TouchStatus::NoReply:
+		return {};
 	default:
 		throw std::invalid_argument("invalid touch response status");
+	}
+}
+
+inline std::string_view ok_text(OkStatus status) {
+	switch (status) {
+	case OkStatus::Ok:
+		return "OK\r\n";
+	case OkStatus::NoReply:
+		return {};
+	default:
+		throw std::invalid_argument("invalid OK response status");
 	}
 }
 
@@ -605,6 +632,14 @@ bool emit_concrete(Sink &out, const T &value) {
 	} else if constexpr (std::is_same_v<T, TouchResponse>) {
 		out.append(touch_text(value.status));
 	} else if constexpr (IsArithmeticResponse<T>::value) {
+		switch (value.status) {
+		case ArithmeticStatus::NoReply:
+			return false;
+		case ArithmeticStatus::Reply:
+			break;
+		default:
+			throw std::invalid_argument("invalid arithmetic response status");
+		}
 		if (value.value) {
 			out.append_uint(*value.value);
 			out.append("\r\n");
@@ -612,7 +647,7 @@ bool emit_concrete(Sink &out, const T &value) {
 			out.append("NOT_FOUND\r\n");
 		}
 	} else if constexpr (std::is_same_v<T, FlushAllResponse> || std::is_same_v<T, VerbosityResponse>) {
-		out.append("OK\r\n");
+		out.append(ok_text(value.status));
 	} else if constexpr (std::is_same_v<T, StatsResponse>) {
 		emit_stats(out, value);
 	} else if constexpr (std::is_same_v<T, VersionResponse>) {
@@ -687,6 +722,7 @@ SendResult send_concrete(boost::asio::ip::tcp::socket &socket, const T &value) {
 
 struct EncodedResponseBatch {
 	std::string bytes;
+	// 已处理的响应对象数，包含 NoReply 和 Quit。
 	std::size_t responses_encoded = 0;
 	bool close_connection = false;
 };
@@ -733,4 +769,4 @@ public:
 	}
 };
 
-} // namespace comm
+} // namespace fastest

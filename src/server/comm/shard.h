@@ -40,10 +40,6 @@ private:
 template <typename Request, typename Response>
 class ShardComm {
 public:
-	// [[nodiscard]] inline size_t get_shard_num() const {
-	// 	return shard_num_;
-	// }
-
 	static std::vector<ShardComm> create_shard_comm(const std::size_t num) {
 		std::vector<ShardComm> vec;
 		auto request_mailbox = std::make_shared<SharedSystem<Request>>(num);
@@ -64,6 +60,9 @@ public:
 
 	[[nodiscard]] std::size_t current_shard_id() const {
 		return shard_id_;
+	}
+	[[nodiscard]] std::size_t shard_num() const {
+		return shard_num_;
 	}
 
 	[[nodiscard]] bool is_current_shard(const std::size_t shard_id) const {
@@ -112,4 +111,4 @@ private:
 	std::shared_ptr<SharedSystem<Request>> request_mailbox;
 	std::shared_ptr<SharedSystem<Response>> response_mailbox;
 };
-} // namespace comm
+} // namespace fastest
