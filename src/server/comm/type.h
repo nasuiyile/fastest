@@ -3,12 +3,12 @@
 #include "../../protocol/memcached_response.h"
 
 namespace comm {
-
 struct MultiKeyRequest {
 	// 需要返回多少个这样的命令才可以
 	uint16_t count;
 	MultiKeyCommand command;
 };
+
 struct SingleKeyRequest {
 	SingleKeyCommand command;
 };
@@ -23,13 +23,15 @@ struct ShardResponse {
 using RequestData = std::variant<SingleKeyRequest, MultiKeyRequest>;
 using ResponseData = std::variant<SingleKeyResponse, ErrorResponse, ShardResponse>;
 
-using RingResponseData = std::variant<SingleKeyResponse, ErrorResponse, std::vector<ShardResponse>>;
+using RingResponseData = std::variant<SingleKeyResponse, ErrorResponse, std::vector<ShardResponse> >;
 
 struct ResponseMessage {
 	uint64_t tcp_id; // tcp编号
 	uint32_t seq;    // 请求编号，允许回绕
+	uint16_t shard_id;
 	ResponseData data;
 };
+
 struct RingResponseMessage {
 	uint64_t tcp_id; // tcp编号
 	uint32_t seq;    // 请求编号，允许回绕
@@ -40,6 +42,7 @@ struct RingResponseMessage {
 struct RequestMessage {
 	uint64_t tcp_id; // tcp的32位fd编号
 	uint32_t seq;    // 请求编号，允许回绕
+	uint16_t shard_id;
 	RequestData data;
 };
 

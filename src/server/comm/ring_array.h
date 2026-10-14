@@ -13,7 +13,6 @@
 #include "type.h"
 
 namespace comm {
-
 class RingArray {
 	using MultiResponses = std::vector<ShardResponse>;
 	using Slot = std::optional<RingResponseMessage>;
@@ -48,18 +47,18 @@ public:
 		auto &slot = ring_[position(message.seq)];
 		if (!slot) {
 			std::visit(
-			    [&](auto &response) {
-				    using T = std::remove_cvref_t<decltype(response)>;
-				    if constexpr (std::is_same_v<T, ShardResponse>) {
-					    MultiResponses responses;
-					    responses.reserve(response.count);
-					    responses.emplace_back(std::move(response));
-					    slot.emplace(message.tcp_id, message.seq, std::move(responses));
-				    } else {
-					    slot.emplace(message.tcp_id, message.seq, std::move(response));
-				    }
-			    },
-			    message.data);
+				[&](auto &response) {
+					using T = std::remove_cvref_t<decltype(response)>;
+					if constexpr (std::is_same_v<T, ShardResponse>) {
+						MultiResponses responses;
+						responses.reserve(response.count);
+						responses.emplace_back(std::move(response));
+						slot.emplace(message.tcp_id, message.seq, std::move(responses));
+					} else {
+						slot.emplace(message.tcp_id, message.seq, std::move(response));
+					}
+				},
+				message.data);
 			return;
 		}
 
@@ -147,16 +146,17 @@ public:
 
 		std::optional<ResponseMessage> result;
 		std::visit(
-		    [&](auto &response) {
-			    using T = std::remove_cvref_t<decltype(response)>;
-			    if constexpr (std::is_same_v<T, MultiResponses>) {
-				    result.emplace(slot->tcp_id, slot->seq,
-				                   ResponseData(std::in_place_type<ShardResponse>, merge_shards(response)));
-			    } else {
-				    result.emplace(slot->tcp_id, slot->seq, ResponseData(std::in_place_type<T>, std::move(response)));
-			    }
-		    },
-		    slot->data);
+			[&](auto &response) {
+				using T = std::remove_cvref_t<decltype(response)>;
+				if constexpr (std::is_same_v<T, MultiResponses>) {
+					result.emplace(slot->tcp_id, slot->seq, 0,
+					               ResponseData(std::in_place_type<ShardResponse>, merge_shards(response)));
+				} else {
+					result.emplace(slot->tcp_id, slot->seq, 0,
+					               ResponseData(std::in_place_type<T>, std::move(response)));
+				}
+			},
+			slot->data);
 
 		slot.reset();
 		++next_id_;
@@ -173,35 +173,35 @@ private:
 	// 合并顺序是分片到达顺序，各分片内部的条目顺序保持不变。
 	[[nodiscard]] static ShardResponse merge_shards(MultiResponses &responses) {
 		return std::visit(
-		    [&](auto &first) -> ShardResponse {
-			    using T = std::remove_cvref_t<decltype(first)>;
-			    using Item = typename std::remove_cvref_t<decltype(first.items)>::value_type;
-			    static_assert(std::is_nothrow_move_constructible_v<Item>, "Response items must be nothrow movable");
+			[&](auto &first) -> ShardResponse {
+				using T = std::remove_cvref_t<decltype(first)>;
+				using Item = typename std::remove_cvref_t<decltype(first.items)>::value_type;
+				static_assert(std::is_nothrow_move_constructible_v<Item>, "Response items must be nothrow movable");
 
-			    std::size_t total = first.items.size();
-			    for (std::size_t i = 1; i < responses.size(); ++i) {
-				    const auto *part = std::get_if<T>(&responses[i].command.variant());
-				    if (!part) {
-					    throw std::logic_error("Inconsistent multi-key response type");
-				    }
-				    if (part->items.size() > first.items.max_size() - total) {
-					    throw std::length_error("Merged response exceeds vector max_size");
-				    }
-				    total += part->items.size();
-			    }
+				std::size_t total = first.items.size();
+				for (std::size_t i = 1; i < responses.size(); ++i) {
+					const auto *part = std::get_if<T>(&responses[i].command.variant());
+					if (!part) {
+						throw std::logic_error("Inconsistent multi-key response type");
+					}
+					if (part->items.size() > first.items.max_size() - total) {
+						throw std::length_error("Merged response exceeds vector max_size");
+					}
+					total += part->items.size();
+				}
 
-			    // reserve 失败时尚未移动条目，原始分片数据保持完整。
-			    first.items.reserve(total);
-			    for (std::size_t i = 1; i < responses.size(); ++i) {
-				    auto &part = std::get<T>(responses[i].command.variant());
-				    for (auto &item : part.items) {
-					    first.items.emplace_back(std::move(item));
-				    }
-			    }
+				// reserve 失败时尚未移动条目，原始分片数据保持完整。
+				first.items.reserve(total);
+				for (std::size_t i = 1; i < responses.size(); ++i) {
+					auto &part = std::get<T>(responses[i].command.variant());
+					for (auto &item : part.items) {
+						first.items.emplace_back(std::move(item));
+					}
+				}
 
-			    return ShardResponse {1, std::move(responses.front().command)};
-		    },
-		    responses.front().command.variant());
+				return ShardResponse{1, std::move(responses.front().command)};
+			},
+			responses.front().command.variant());
 	}
 
 	[[nodiscard]] std::size_t position(std::uint32_t seq) const noexcept {
@@ -223,9 +223,8 @@ private:
 		ring_.swap(new_ring);
 	}
 
-	static constexpr std::uint32_t kHalfRange = std::uint32_t {1} << 31;
+	static constexpr std::uint32_t kHalfRange = std::uint32_t{1} << 31;
 	std::uint32_t next_id_;
 	std::vector<Slot> ring_;
 };
-
 } // namespace comm
