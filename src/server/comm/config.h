@@ -1,7 +1,7 @@
 
 #pragma once
 #include <string>
-namespace comm {
+namespace fastest {
 struct Config {
 	unsigned short port = 2333;
 	std::string addr = "0.0.0.0";

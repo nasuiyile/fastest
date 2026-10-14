@@ -12,7 +12,7 @@
 
 #include "type.h"
 
-namespace comm {
+namespace fastest {
 class RingArray {
 	using MultiResponses = std::vector<ShardResponse>;
 	using Slot = std::optional<RingResponseMessage>;

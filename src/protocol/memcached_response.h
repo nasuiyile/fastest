@@ -3,7 +3,6 @@
 #include <array>
 #include <charconv>
 #include <cstddef>
-#include <cstdint>
 #include <limits>
 #include <optional>
 #include <span>
@@ -20,7 +19,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
 
-namespace comm {
+namespace fastest {
 
 // C++20 + Boost.Asio。send_to() 是同步发送接口，socket 必须由调用方独占写入。
 enum class ResponseType : std::uint8_t {

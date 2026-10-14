@@ -20,16 +20,10 @@ find_package(Catch2 3 REQUIRED)
 # =========================
 add_executable(fastest
         src/main.cpp
-        src/protocol/memcahed_request.h
-        src/server/fastest_server.h
         src/cache/core_cache.h
-        src/server/config.h
         src/util/hardware_info.h
-        src/server/mailbox.h
-        src/server/shard_registry.h
-        src/server/worker.h
         src/server/comm/ring_array.h
-        "src/server/comm/mailbox.h"
+        src/server/comm/mailbox.h
         src/server/comm/worker.h
         src/server/comm/shard.h
         src/server/comm/shard.h

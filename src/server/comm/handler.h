@@ -3,18 +3,17 @@
 #include "config.h"
 
 #include <thread>
-
 #include <utility>
 #include <boost/asio.hpp>
 #include <spdlog/spdlog.h>
 #include <atomic>
-
 #include "worker.h"
 #include "../../protocol/memcached_parser.h"
 #include "type.h"
+#include "../../util/hardware_info.h"
 #include <sys/socket.h>
 
-namespace comm {
+namespace fastest {
 using asio::awaitable;
 using asio::use_awaitable;
 using asio::ip::tcp;
@@ -25,15 +24,15 @@ public:
 		thread_ = std::thread([this] { run(); });
 	}
 
-	static std::vector<std::unique_ptr<Handler>> create_handlers(const Config &cfg) {
+	static std::vector<std::unique_ptr<Handler> > create_handlers(const Config &cfg) {
 		const std::size_t core_num = util::core_num();
 		const auto stop = std::make_shared<std::atomic_bool>(false);
 		auto workers = Worker::create_workers(core_num, stop);
-		std::vector<std::unique_ptr<Handler>> handlers;
+		std::vector<std::unique_ptr<Handler> > handlers;
 		handlers.reserve(workers.size());
 		for (auto &worker : workers) {
 			handlers.push_back(
-			    std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
+				std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
 		}
 		return handlers;
 	}
@@ -46,7 +45,7 @@ public:
 
 private:
 	explicit Handler(Config config, std::unique_ptr<Worker> worker, std::shared_ptr<std::atomic_bool> stop)
-	    : config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
+		: config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
 	}
 
 	// 最大读取命令行的限制，命令行是\r\n结尾的
@@ -84,17 +83,17 @@ private:
 	void execute_batch(const std::vector<Command> &vector, uint64_t tcp_id) {
 		for (Command variant : vector) {
 			std::visit(
-			    [this, tcp_id](auto &&arg) {
-				    using T = std::decay_t<decltype(arg)>;
-				    if constexpr (std::is_same_v<T, SingleKeyCommand>) {
-					    worker_->send_single_command(arg, tcp_id);
-				    } else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
-					    worker_->send_multi_command(arg, tcp_id);
-				    } else if constexpr (std::is_same_v<T, NoKeyCommand>) {
-					    // ...
-				    }
-			    },
-			    variant);
+				[this, tcp_id](auto &&arg) {
+					using T = std::decay_t<decltype(arg)>;
+					if constexpr (std::is_same_v<T, SingleKeyCommand>) {
+						worker_->send_single_command(arg, tcp_id);
+					} else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
+						worker_->send_multi_command(arg, tcp_id);
+					} else if constexpr (std::is_same_v<T, NoKeyCommand>) {
+						// ...
+					}
+				},
+				variant);
 		}
 	};
 
@@ -110,7 +109,7 @@ private:
 			const MemcachedParser parser;
 			// 保留上一次没有解析完的数据
 			std::string input;
-			std::array<char, 4096> recv_buffer {};
+			std::array<char, 4096> recv_buffer{};
 			while (!stop_->load(std::memory_order_relaxed)) {
 				auto result = parser.parse(std::span(input.data(), input.size()), 128);
 				// 先执行成功解析的命令，确保响应顺序正确
@@ -202,7 +201,7 @@ private:
 	}
 
 	// 每次收到TCP都分配一个新版本号
-	uint64_t tcp_id_ {0};
+	uint64_t tcp_id_{0};
 
 	std::thread thread_;
 

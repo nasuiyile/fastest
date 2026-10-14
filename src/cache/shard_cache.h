@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <variant>
 
-namespace comm {
+namespace fastest {
 
 class ShardCache {
 public:

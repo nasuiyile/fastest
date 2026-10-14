@@ -6,7 +6,7 @@
 
 #include "../../util/hash.h"
 
-namespace comm {
+namespace fastest {
 namespace asio = boost::asio;
 using asio::awaitable;
 

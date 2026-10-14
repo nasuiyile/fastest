@@ -2,7 +2,7 @@
 #include "../../protocol/memcached_parser.h"
 #include "../../protocol/memcached_response.h"
 
-namespace comm {
+namespace fastest {
 struct MultiKeyRequest {
 	// 需要返回多少个这样的命令才可以
 	uint16_t count;

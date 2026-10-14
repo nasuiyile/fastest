@@ -20,7 +20,7 @@ struct ShardEvent {
 
 // constexpr std::size_t kMailboxCapacity = 4096;
 
-namespace comm {
+namespace fastest {
 template <typename Message>
 class alignas(64) Mailbox {
 	static_assert(std::is_trivially_copyable_v<ShardEvent<Message> >, "ShardEvent must be trivially copyable");

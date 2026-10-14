@@ -2,7 +2,6 @@
 
 #include <charconv>
 #include <cstddef>
-#include <cstdint>
 #include <limits>
 #include <optional>
 #include <span>
@@ -15,7 +14,7 @@
 #include <variant>
 #include <vector>
 
-namespace comm {
+namespace fastest {
 using Value = std::string;
 using Key = std::string;
 struct ItemKey {

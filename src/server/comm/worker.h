@@ -10,7 +10,7 @@
 #include "../../protocol/memcached_parser.h"
 #include "../../cache/shard_cache.h"
 
-namespace comm {
+namespace fastest {
 namespace asio = boost::asio;
 
 using asio::awaitable;
