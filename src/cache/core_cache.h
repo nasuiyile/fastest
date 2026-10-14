@@ -22,7 +22,7 @@
 #include <string_view>
 #include <utility>
 
-namespace cache {
+namespace fastest {
 namespace bi = boost::intrusive;
 
 class FastByteHash {
@@ -137,7 +137,8 @@ private:
 		}
 
 	private:
-		static bool equal(const std::uint64_t lhs_hash, const key_view lhs, const std::uint64_t rhs_hash, const key_view rhs) noexcept {
+		static bool equal(const std::uint64_t lhs_hash, const key_view lhs, const std::uint64_t rhs_hash,
+		                  const key_view rhs) noexcept {
 			if (lhs_hash != rhs_hash || lhs.size() != rhs.size()) {
 				return false;
 			}

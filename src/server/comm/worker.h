@@ -21,7 +21,7 @@ struct TCPSession {
 	tcp::socket socket;
 	RingArray ring_array;
 	uint32_t seq{0};
-
+	bool closing{false}; // 已决定关闭：不再发送，也不再执行新命令
 	explicit TCPSession(tcp::socket &&s) : socket(std::move(s)) {
 	}
 };
@@ -216,34 +216,73 @@ private:
 		                                std::make_unique<ResponseMessage>(std::move(response_message)));
 	}
 
+	// ---- Worker private ----
 	void handle_response_message(const std::unique_ptr<ResponseMessage> &message) {
 		auto it = tcp_session_.find(message->tcp_id);
-		if (it == tcp_session_.end() || !it->second) {
+		if (it == tcp_session_.end() || !it->second)
 			return;
-		}
 		auto &session = *it->second;
-		auto &ring_array = session.ring_array;
-		auto &socket = session.socket;
-		ring_array.append(*message);
-		while (ring_array.is_ready()) {
-			auto response_message = ring_array.try_pop();
-			if (!response_message.has_value()) {
-				return;
+		if (session.closing)
+			return; // 丢弃迟到响应
+
+		session.ring_array.append(std::move(*message)); // 顺便省一次拷贝
+		while (!session.closing) {
+			auto popped = session.ring_array.try_pop();
+			if (!popped)
+				break;
+			if (!send_response(session, popped->data)) {
+				close_session(session);
 			}
-			auto &msg = *response_message;
-			std::visit(
-				[&socket](const auto &value) {
+		}
+	}
+
+	// 返回 false 表示应关闭连接
+	bool send_response(TCPSession &session, const ResponseData &data) {
+		auto &socket = session.socket;
+		try {
+			const SendResult r = std::visit(
+				[&socket](const auto &value) -> SendResult {
 					using T = std::remove_cvref_t<decltype(value)>;
-					if constexpr (std::is_same_v<T, SingleKeyResponse>) {
-						value.send_to(socket);
-					} else if constexpr (std::is_same_v<T, ErrorResponse>) {
-						value.send_to(socket);
-					} else if constexpr (std::is_same_v<T, ShardResponse>) {
-						value.command.send_to(socket);
+					if constexpr (std::is_same_v<T, ShardResponse>) {
+						return value.command.send_to(socket);
+					} else {
+						return value.send_to(socket);
 					}
 				},
-				msg.data);
+				data);
+			return !r.close_connection; // Quit / 致命错误 → 关闭
+		} catch (const boost::system::system_error &e) {
+			const auto ec = e.code();
+			if (ec != asio::error::broken_pipe && ec != asio::error::connection_reset &&
+			    ec != asio::error::eof && ec != asio::error::bad_descriptor) {
+				spdlog::warn("[shard {}] send failed: {}", current_shard_id(), e.what());
+			}
+			return false;
+		} catch (const std::logic_error &e) {
+			// invalid_argument 是它的子类
+			// 校验阶段抛出，尚未写出任何字节：补一条 SERVER_ERROR 占住这个 seq
+			spdlog::error("[shard {}] encode failed: {}", current_shard_id(), e.what());
+			return send_server_error(session);
+		} catch (...) {
+			return false; // 不确定写了多少，只能断开
 		}
+	}
+
+	bool send_server_error(TCPSession &session) {
+		try {
+			const ErrorResponse err{.kind = ResponseErrorKind::ServerError,
+			                        .message = "response encoding failed"};
+			return !err.send_to(session.socket).close_connection;
+		} catch (...) {
+			return false;
+		}
+	}
+
+	static void close_session(TCPSession &session) {
+		session.closing = true;
+		boost::system::error_code ec;
+		session.socket.shutdown(tcp::socket::shutdown_both, ec);
+		session.socket.close(ec); // 唤醒 session() 中的 async_read_some，由它负责 erase
 	}
 
 	ShardCache data_;

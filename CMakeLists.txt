@@ -14,6 +14,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Boost CONFIG REQUIRED COMPONENTS asio intrusive system lockfree)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Catch2 3 REQUIRED)
+find_package(mimalloc REQUIRED)
 
 # =========================
 # Main executable
@@ -44,6 +45,7 @@ target_link_libraries(fastest
         Boost::system
         Boost::lockfree
         spdlog::spdlog
+        mimalloc
 )
 
 # =========================
