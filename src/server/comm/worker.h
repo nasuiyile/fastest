@@ -215,6 +215,7 @@ public:
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(std::move(request_message)));
 	}
 
+	// 过大value 需要把同名值删掉，否则旧数据会一直留着。
 	void send_error_command(ErrorResponse response, const uint64_t tcp_id,
 	                        std::optional<ItemKey> rejected_set_key = std::nullopt,
 	                        const bool wait_for_swallow = false) {

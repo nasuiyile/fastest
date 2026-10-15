@@ -25,15 +25,15 @@ public:
 		thread_ = std::thread([this] { run(); });
 	}
 
-	static std::vector<std::unique_ptr<Handler>> create_handlers(const Config &cfg) {
+	static std::vector<std::unique_ptr<Handler> > create_handlers(const Config &cfg) {
 		const std::size_t core_num = util::core_num();
 		const auto stop = std::make_shared<std::atomic_bool>(false);
 		auto workers = Worker::create_workers(core_num, stop);
-		std::vector<std::unique_ptr<Handler>> handlers;
+		std::vector<std::unique_ptr<Handler> > handlers;
 		handlers.reserve(workers.size());
 		for (auto &worker : workers) {
 			handlers.push_back(
-			    std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
+				std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
 		}
 		return handlers;
 	}
@@ -46,7 +46,7 @@ public:
 
 private:
 	explicit Handler(Config config, std::unique_ptr<Worker> worker, std::shared_ptr<std::atomic_bool> stop)
-	    : config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
+		: config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
 	}
 
 	static constexpr std::size_t kReadChunkBytes = 4096;
@@ -62,17 +62,17 @@ private:
 		// vector avoids copying multi-key command vectors on the hot path.
 		for (Command &command : commands) {
 			std::visit(
-			    [this, tcp_id](auto &arg) {
-				    using T = std::decay_t<decltype(arg)>;
-				    if constexpr (std::is_same_v<T, SingleKeyCommand>) {
-					    worker_->send_single_command(std::move(arg), tcp_id);
-				    } else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
-					    worker_->send_multi_command(arg, tcp_id);
-				    } else if constexpr (std::is_same_v<T, NoKeyCommand>) {
-					    // No-key commands are not routed through key shards.
-				    }
-			    },
-			    command);
+				[this, tcp_id](auto &arg) {
+					using T = std::decay_t<decltype(arg)>;
+					if constexpr (std::is_same_v<T, SingleKeyCommand>) {
+						worker_->send_single_command(std::move(arg), tcp_id);
+					} else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
+						worker_->send_multi_command(arg, tcp_id);
+					} else if constexpr (std::is_same_v<T, NoKeyCommand>) {
+						// No-key commands are not routed through key shards.
+					}
+				},
+				command);
 		}
 	};
 
@@ -88,7 +88,8 @@ private:
 			const MemcachedParser parser;
 			// 保留上一次没有解析完的数据
 			std::string input;
-			std::array<char, kReadChunkBytes> recv_buffer {};
+			std::array<char, kReadChunkBytes> recv_buffer{};
+			//需要丢弃的字节
 			std::size_t discard_remaining = 0;
 			while (!tcp_session.closing && !stop_->load(std::memory_order_relaxed)) {
 				if (discard_remaining != 0) {
@@ -143,6 +144,7 @@ private:
 			}
 		} catch (const std::exception &e) {
 			spdlog::error("[shard {}] session exception: {}", shard_id, e.what());
+
 		} catch (...) {
 			spdlog::error("[shard {}] session unknown exception", shard_id);
 		}
@@ -211,7 +213,7 @@ private:
 	}
 
 	// 每次收到TCP都分配一个新版本号
-	uint64_t tcp_id_ {0};
+	uint64_t tcp_id_{0};
 
 	std::thread thread_;
 
