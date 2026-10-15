@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include <thread>
+#include <algorithm>
 #include <utility>
 #include <boost/asio.hpp>
 #include <spdlog/spdlog.h>
@@ -48,50 +49,30 @@ private:
 	    : config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
 	}
 
-	// 最大读取命令行的限制，命令行是\r\n结尾的
-	static constexpr std::size_t kMaxCommandLineBytes = 8 * 1024;
-	// 单次最多读取字节数
 	static constexpr std::size_t kReadChunkBytes = 4096;
 
-	static std::string_view parse_error_message(ParseErrorCode code) noexcept {
-		using enum ParseErrorCode;
-		switch (code) {
-		case UnknownCommand:
-			return "ERROR\r\n";
-		case InvalidKey:
-			return "CLIENT_ERROR bad key\r\n";
-		case ValueTooLarge:
-			return "SERVER_ERROR object too large\r\n";
-		case BadDataChunk:
-			return "CLIENT_ERROR bad data chunk\r\n";
-		case CommandLineTooLong:
-			return "CLIENT_ERROR command line too long\r\n";
-		default:
-			return "CLIENT_ERROR bad command line format\r\n";
-		}
+	bool handle_parse_error(const uint64_t tcp_id, ParseError &error, const bool wait_for_swallow) const {
+		worker_->send_error_command(to_error_response(error), tcp_id, std::move(error.rejected_set_key),
+		                            wait_for_swallow);
+		return error.recovery == ErrorRecovery::Continue;
 	}
 
-	awaitable<bool> handle_parse_error(const uint64_t tcp_id, const ParseError &error) const {
-		// co_await write_text(socket, parse_error_message(error.code));
-		ErrorResponse error_response = to_error_response(error);
-		worker_->send_error_command(error_response, tcp_id);
-		co_return error.recovery == ErrorRecovery::Continue;
-	}
-
-	void execute_batch(const std::vector<Command> &vector, uint64_t tcp_id) {
-		for (Command variant : vector) {
+	void execute_batch(std::vector<Command> &commands, const uint64_t tcp_id) {
+		// Commands own all data that may outlive this parse call. Referencing the
+		// vector avoids copying multi-key command vectors on the hot path.
+		for (Command &command : commands) {
 			std::visit(
-			    [this, tcp_id](auto &&arg) {
+			    [this, tcp_id](auto &arg) {
 				    using T = std::decay_t<decltype(arg)>;
 				    if constexpr (std::is_same_v<T, SingleKeyCommand>) {
-					    worker_->send_single_command(arg, tcp_id);
+					    worker_->send_single_command(std::move(arg), tcp_id);
 				    } else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
 					    worker_->send_multi_command(arg, tcp_id);
 				    } else if constexpr (std::is_same_v<T, NoKeyCommand>) {
-					    // ...
+					    // No-key commands are not routed through key shards.
 				    }
 			    },
-			    variant);
+			    command);
 		}
 	};
 
@@ -107,19 +88,45 @@ private:
 			const MemcachedParser parser;
 			// 保留上一次没有解析完的数据
 			std::string input;
-			std::array<char, 4096> recv_buffer {};
-			while (!stop_->load(std::memory_order_relaxed)) {
+			std::array<char, kReadChunkBytes> recv_buffer {};
+			std::size_t discard_remaining = 0;
+			while (!tcp_session.closing && !stop_->load(std::memory_order_relaxed)) {
+				if (discard_remaining != 0) {
+					const std::size_t buffered = std::min(discard_remaining, input.size());
+					input.erase(0, buffered);
+					discard_remaining -= buffered;
+					if (discard_remaining == 0) {
+						worker_->finish_swallow(tcp_id);
+						continue;
+					}
+					const std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
+					const std::size_t dropped = std::min(discard_remaining, n);
+					discard_remaining -= dropped;
+					if (n > dropped) {
+						input.append(recv_buffer.data() + dropped, n - dropped);
+					}
+					if (discard_remaining == 0) {
+						worker_->finish_swallow(tcp_id);
+					}
+					continue;
+				}
+
 				auto result = parser.parse(std::span(input.data(), input.size()), 128);
 				// 先执行成功解析的命令，确保响应顺序正确
 				execute_batch(result.commands, tcp_id);
 				bool keep_connection = true;
 				if (result.stop == StopReason::Error) {
-					keep_connection = co_await handle_parse_error(tcp_id, *result.error);
+					keep_connection = handle_parse_error(tcp_id, *result.error, result.discard_bytes != 0);
 				}
-				// 所有 CommandView 使用完毕后才能消费
+				// 解析结果已投递后才能消费未解析输入
 				input.erase(0, result.consumed);
+				discard_remaining = result.discard_bytes;
 				if (!keep_connection) {
-					co_return;
+					// The error response already occupies its sequence number. Stop
+					// reading, but let the worker drain earlier responses first; the
+					// ordered response path then closes the socket after this error.
+					tcp_session.protocol_error_waiting = true;
+					break;
 				}
 				if (result.stop == StopReason::Error || result.stop == StopReason::BatchLimit) {
 					// 继续解析剩余缓冲区
@@ -139,7 +146,12 @@ private:
 		} catch (...) {
 			spdlog::error("[shard {}] session unknown exception", shard_id);
 		}
-		worker_->tcp_session_.erase(tcp_id);
+		// A fatal parse error may still have earlier cross-shard responses in the
+		// ring. Keep the session object until the ordered writer closes it.
+		tcp_session.session_exited = true;
+		if (!tcp_session.protocol_error_waiting || tcp_session.closing) {
+			worker_->tcp_session_.erase(tcp_id);
+		}
 	}
 
 	void run() {

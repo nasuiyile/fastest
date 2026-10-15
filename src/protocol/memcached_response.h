@@ -176,18 +176,21 @@ struct ErrorResponse {
 	ResponseErrorKind kind = ResponseErrorKind::Error;
 	std::string message;
 	bool close_connection = false;
+	bool noreply = false;
 
 	// 错误响应是 Response 的独立分支，也支持直接发送；复用统一的协议编码及固定容量发送器。
 	[[nodiscard]] SendResult send_to(boost::asio::ip::tcp::socket &socket) const;
 };
 
 // 将解析错误转换为可直接 send_to(socket) 或放入 ResponseBatch 的响应。
-// 未知命令使用协议规定的 ERROR（不携带消息）；其他错误使用 CLIENT_ERROR。
+// 未知命令使用协议规定的 ERROR；对象过大使用可恢复的 SERVER_ERROR，其他错误使用 CLIENT_ERROR。
 [[nodiscard]] inline ErrorResponse to_error_response(const ParseError &error) {
 	ErrorResponse response;
 	response.kind = ResponseErrorKind::ClientError;
 	response.close_connection = error.recovery == ErrorRecovery::CloseConnection;
+	response.noreply = error.noreply;
 	switch (error.code) {
+	case ParseErrorCode::BadArgumentCount:
 	case ParseErrorCode::UnknownCommand:
 		response.kind = ResponseErrorKind::Error;
 		response.message = "unknown command";
@@ -196,12 +199,14 @@ struct ErrorResponse {
 		response.message = "bad command line format";
 		break;
 	case ParseErrorCode::InvalidKey:
-		response.message = "invalid key";
+		response.message = "bad command line format";
 		break;
 	case ParseErrorCode::InvalidNumber:
-		response.message = "invalid numeric argument";
+		response.message = "bad command line format";
 		break;
 	case ParseErrorCode::ValueTooLarge:
+		// The session swallows the declared data block before parsing again.
+		response.kind = ResponseErrorKind::ServerError;
 		response.message = "object too large for cache";
 		break;
 	case ParseErrorCode::BadDataChunk:
@@ -703,7 +708,9 @@ bool emit_concrete(Sink &out, const T &value) {
 	} else if constexpr (std::is_same_v<T, QuitResponse>) {
 		return true;
 	} else if constexpr (std::is_same_v<T, ErrorResponse>) {
-		emit_error(out, value);
+		if (!value.noreply) {
+			emit_error(out, value);
+		}
 		return value.close_connection;
 	} else if constexpr (std::is_same_v<T, NoReplyResponse>) {
 		// noreply：执行完成，但不向客户端输出任何字节。

@@ -12,11 +12,15 @@ namespace fastest {
 
 class ShardCache {
 public:
+	void erase_rejected_set(const ItemKey &key) {
+		data_.erase(key);
+	}
+
 	MultiKeyResponse handle_multi_command(const MultiKeyCommand &command) {
 		return std::visit(
 		    [this](const auto &value) -> MultiKeyResponse {
 			    using T = std::remove_cvref_t<decltype(value)>;
- 			    if constexpr (std::is_same_v<T, MultiGetCommand>) {
+			    if constexpr (std::is_same_v<T, MultiGetCommand>) {
 				    return handle_multi_get(value);
 			    } else {
 				    throw std::logic_error("multi command not implemented");
@@ -26,11 +30,15 @@ public:
 	}
 
 	SingleKeyResponse handle_single_command(const SingleKeyCommand &command) {
+		return handle_single_command(SingleKeyCommand(command));
+	}
+
+	SingleKeyResponse handle_single_command(SingleKeyCommand &&command) {
 		return std::visit(
-		    [this](const auto &value) -> SingleKeyResponse {
+		    [this](auto &value) -> SingleKeyResponse {
 			    using T = std::remove_cvref_t<decltype(value)>;
 			    if constexpr (std::is_same_v<T, SetCommand>) {
-				    return handle_set(value);
+				    return handle_set(std::move(value));
 			    } else if constexpr (std::is_same_v<T, SingleGetCommand>) {
 				    return handle_single_get(value);
 			    } else {
@@ -41,10 +49,10 @@ public:
 	}
 
 private:
-	SetResponse handle_set(const SetCommand &command) {
-		// value 是 string_view，必须复制为缓存自己持有的 string。
-		// key 不存在时插入，存在时覆盖 flags 和 value。
-		data_.insert_or_assign(command.key, Item {.flags = command.flags, .value = std::string(command.value)});
+	SetResponse handle_set(SetCommand &&command) {
+		// The parser copies the payload once. Transfer its allocation all the
+		// way into the cache, including when it crossed a shard mailbox.
+		data_.insert_or_assign(std::move(command.key), Item {.flags = command.flags, .value = std::move(command.value)});
 		if (command.noreply) {
 			return SetResponse {StorageStatus::NoReply};
 		}

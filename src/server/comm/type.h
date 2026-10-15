@@ -13,14 +13,21 @@ struct SingleKeyRequest {
 	SingleKeyCommand command;
 };
 
+// Failed oversized SET has a mutation even though it returns an error.
+// Route it through the key's mailbox so an earlier SET cannot resurrect stale data.
+struct RejectedSetRequest {
+	ItemKey key;
+	ErrorResponse response;
+};
+
 struct ShardResponse {
 	// 一共需要多少个
 	uint16_t count;
 	MultiKeyResponse command;
 };
 
-// 包含俩种枚举，分别是多key和单key操作
-using RequestData = std::variant<SingleKeyRequest, MultiKeyRequest>;
+// 按 key 路由的请求；拒绝过大 SET 的删除操作也必须保持分片内顺序。
+using RequestData = std::variant<SingleKeyRequest, MultiKeyRequest, RejectedSetRequest>;
 using ResponseData = std::variant<SingleKeyResponse, ErrorResponse, ShardResponse>;
 
 using RingResponseData = std::variant<SingleKeyResponse, ErrorResponse, std::vector<ShardResponse> >;

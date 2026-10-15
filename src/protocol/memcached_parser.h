@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <span>
@@ -61,7 +64,7 @@ struct StorageCommandT {
 	ItemKey key;
 	std::uint32_t flags = 0;
 	std::uint32_t exptime = 0;
-	std::string_view value;
+	std::string value;
 	bool noreply = false;
 };
 
@@ -77,7 +80,7 @@ struct CasCommand {
 	ItemKey key;
 	std::uint32_t flags = 0;
 	std::uint32_t exptime = 0;
-	std::string_view value;
+	std::string value;
 	std::uint64_t cas_unique = 0;
 	bool noreply = false;
 };
@@ -167,7 +170,7 @@ struct VerbosityCommand {
 struct StatsCommand {
 	static constexpr CommandType command_type = CommandType::Stats;
 
-	std::string_view arguments;
+	std::string arguments;
 };
 
 struct VersionCommand {
@@ -188,7 +191,7 @@ struct SingleKeyCommand {
 
 	template <typename T>
 	    requires std::is_constructible_v<Variant, T>
-	explicit SingleKeyCommand(T value) : command(std::move(value)) {
+	explicit SingleKeyCommand(T &&value) : command(std::forward<T>(value)) {
 	}
 
 	[[nodiscard]] const ItemKey &item_key() const {
@@ -207,7 +210,7 @@ struct MultiKeyCommand {
 
 	template <typename T>
 	    requires std::is_constructible_v<Variant, T>
-	explicit MultiKeyCommand(T value) : command(std::move(value)) {
+	explicit MultiKeyCommand(T &&value) : command(std::forward<T>(value)) {
 	}
 
 	[[nodiscard]] const std::vector<ItemKey> &item_keys() const {
@@ -247,6 +250,7 @@ inline CommandType command_type(const Command &command) {
 
 enum class ParseErrorCode : std::uint8_t {
 	UnknownCommand,
+	BadArgumentCount,
 	BadCommandLine,
 	InvalidKey,
 	InvalidNumber,
@@ -266,6 +270,8 @@ struct ParseError {
 	ParseErrorCode code {};
 	ErrorRecovery recovery {};
 	std::size_t offset = 0; // 错误命令起始位置，相对于本次输入
+	bool noreply = false; // 仅在命令头可以可靠识别 noreply 时抑制错误响应
+	std::optional<ItemKey> rejected_set_key; // 过大的 SET 必须在所属分片删除旧值
 };
 
 enum class StopReason : std::uint8_t { EndOfInput, NeedMoreData, Error, BatchLimit };
@@ -275,6 +281,10 @@ struct ParseBatchResult {
 	std::size_t consumed = 0;
 	StopReason stop = StopReason::EndOfInput;
 	std::size_t minimum_additional_bytes = 0;
+	// Bytes after consumed that the session must discard before parsing the
+	// next command. This lets oversized storage values follow memcached's
+	// swallow-and-continue behavior without buffering the payload.
+	std::size_t discard_bytes = 0;
 	std::optional<ParseError> error;
 };
 
@@ -285,7 +295,7 @@ struct ParserLimits {
 };
 
 // 只解析已经传入的字节流，不进行网络读写。
-// 完整命令通过 string_view 引用 input；处理完成前不得移动、覆盖或释放输入缓冲区。
+// 完整命令会复制需要跨线程传递的 payload；解析返回后可以立即消费输入缓冲区。
 // 不完整命令不会被消费，网络层追加数据后重新传入未消费的部分。
 // 协议错误通过 ParseBatchResult::error 返回，内存分配失败等仍可能抛出 C++ 异常。
 class MemcachedParser {
@@ -323,11 +333,18 @@ public:
 			result.consumed += one.consumed;
 			if (one.status == OneStatus::Error) {
 				result.stop = StopReason::Error;
-				result.error = one.error;
+				result.error = std::move(one.error);
+				result.discard_bytes = one.discard_bytes;
 				return result;
 			}
 
 			if (one.command) {
+				if (result.commands.empty()) {
+					// Estimate once from the first complete command. No allocation
+					// for empty/incomplete input, and fewer vector growth copies
+					// for pipelined batches (bounded by max_commands).
+					result.commands.reserve(std::min(max_commands, input.size() / one.consumed));
+				}
 				result.commands.emplace_back(std::move(*one.command));
 			}
 		}
@@ -345,6 +362,7 @@ private:
 		std::size_t minimum_additional_bytes = 0;
 		std::optional<Command> command;
 		std::optional<ParseError> error;
+		std::size_t discard_bytes = 0;
 	};
 
 	class TokenCursor {
@@ -421,19 +439,13 @@ private:
 		result.consumed = consumed;
 		// 直接构造指定的内层 variant，避免嵌套 variant 的隐式转换歧义。
 		if constexpr (std::is_constructible_v<SingleKeyCommand, T>) {
-			result.command.emplace(std::in_place_type<SingleKeyCommand>, SingleKeyCommand(std::move(command)));
+			result.command.emplace(std::in_place_type<SingleKeyCommand>, std::move(command));
 		} else if constexpr (std::is_constructible_v<MultiKeyCommand, T>) {
-			result.command.emplace(std::in_place_type<MultiKeyCommand>, MultiKeyCommand(std::move(command)));
+			result.command.emplace(std::in_place_type<MultiKeyCommand>, std::move(command));
 		} else {
 			static_assert(std::is_constructible_v<NoKeyCommand, T>, "unsupported command type");
 			result.command.emplace(std::in_place_type<NoKeyCommand>, std::move(command));
 		}
-		return result;
-	}
-
-	static OneResult skip_empty(std::size_t consumed) noexcept {
-		OneResult result;
-		result.consumed = consumed;
 		return result;
 	}
 
@@ -445,11 +457,13 @@ private:
 	}
 
 	static OneResult failure(const ParseErrorCode code, const ErrorRecovery recovery, const std::size_t consumed,
-	                         const std::size_t offset) noexcept {
+	                         const std::size_t offset, const std::size_t discard_bytes = 0,
+	                         const bool noreply = false) noexcept {
 		OneResult result;
 		result.status = OneStatus::Error;
 		result.consumed = consumed;
-		result.error = ParseError {code, recovery, offset};
+		result.error = ParseError {code, recovery, offset, noreply, std::nullopt};
+		result.discard_bytes = discard_bytes;
 		return result;
 	}
 
@@ -460,32 +474,45 @@ private:
 		const std::string_view exptime_text = cursor.next();
 		const std::string_view bytes_text = cursor.next();
 
-		// bytes 无法确认时，不能知道下一条命令的起点，必须关闭连接。
-		if (key.empty() || flags_text.empty() || exptime_text.empty() || bytes_text.empty()) {
-			return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::CloseConnection, header_bytes, offset);
+		// Match memcached: a malformed header consumes only the line. Bytes
+		// after it are parsed as new commands, even if the client sent a value.
+		const std::string_view cas_text = name == "cas" ? cursor.next() : std::string_view {};
+		if (key.empty() || flags_text.empty() || exptime_text.empty() || bytes_text.empty() ||
+		    (name == "cas" && cas_text.empty())) {
+			return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
 		}
+		const std::string_view option = cursor.next();
+		if (!cursor.done()) {
+			return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
+		}
+		const bool noreply = option == "noreply";
 		if (!valid_key(key)) {
-			return failure(ParseErrorCode::InvalidKey, ErrorRecovery::CloseConnection, header_bytes, offset);
+			return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset, 0, noreply);
 		}
 
 		std::uint32_t flags = 0;
 		std::uint32_t exptime = 0;
 		std::size_t value_bytes = 0;
+		std::uint64_t cas_unique = 0;
 		if (!parse_uint(flags_text, flags) || !parse_uint(exptime_text, exptime) ||
-		    !parse_uint(bytes_text, value_bytes)) {
-			return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::CloseConnection, header_bytes, offset);
-		}
-		if (value_bytes > limits_.max_value_bytes) {
-			return failure(ParseErrorCode::ValueTooLarge, ErrorRecovery::CloseConnection, header_bytes, offset);
+		    !parse_uint(bytes_text, value_bytes) || (name == "cas" && !parse_uint(cas_text, cas_unique)) ||
+		    value_bytes > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() - 2)) {
+			return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::Continue, header_bytes, offset, 0, noreply);
 		}
 
-		std::uint64_t cas_unique = 0;
-		if (name == "cas" && !parse_uint(cursor.next(), cas_unique)) {
-			return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::CloseConnection, header_bytes, offset);
-		}
-		bool noreply = false;
-		if (!parse_noreply(cursor, noreply)) {
-			return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::CloseConnection, header_bytes, offset);
+		// For an object that is too large, memcached emits SERVER_ERROR and
+		// swallows the declared data block. Tell the session to discard it from
+		// the socket directly instead of buffering an unbounded payload.
+		if (value_bytes > limits_.max_value_bytes) {
+			if (value_bytes > std::numeric_limits<std::size_t>::max() - 2) {
+				return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::Continue, header_bytes, offset);
+			}
+			auto result = failure(ParseErrorCode::ValueTooLarge, ErrorRecovery::Continue, header_bytes, offset,
+			                      value_bytes + 2, noreply);
+			if (name == "set") {
+				result.error->rejected_set_key.emplace(std::string(key));
+			}
+			return result;
 		}
 
 		const std::size_t available = input.size() - header_bytes;
@@ -494,37 +521,34 @@ private:
 			const std::size_t suffix_available = available >= value_bytes ? available - value_bytes : 0;
 			const std::size_t missing_suffix = 2 - (suffix_available < 2 ? suffix_available : 2);
 
-			// 在自定义极端 ParserLimits 下，也不允许 size_t 溢出。
 			const std::size_t max = std::numeric_limits<std::size_t>::max();
 			const std::size_t missing = missing_value > max - missing_suffix ? max : missing_value + missing_suffix;
 			return need_more(missing);
 		}
 
 		const char *value_begin = input.data() + header_bytes;
+		const std::size_t total_bytes = header_bytes + value_bytes + 2;
 		if (value_begin[value_bytes] != '\r' || value_begin[value_bytes + 1] != '\n') {
-			return failure(ParseErrorCode::BadDataChunk, ErrorRecovery::CloseConnection, header_bytes + value_bytes + 2,
-			               offset);
+			return failure(ParseErrorCode::BadDataChunk, ErrorRecovery::Continue, total_bytes, offset, 0, noreply);
 		}
 
-		const std::string_view value(value_begin, value_bytes);
-		const std::size_t total_bytes = header_bytes + value_bytes + 2;
-
+		std::string value(value_begin, value_bytes);
 		if (name == "set") {
-			return success(SetCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
+			return success(SetCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
 		}
 		if (name == "add") {
-			return success(AddCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
+			return success(AddCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
 		}
 		if (name == "replace") {
-			return success(ReplaceCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
+			return success(ReplaceCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
 		}
 		if (name == "append") {
-			return success(AppendCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
+			return success(AppendCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
 		}
 		if (name == "prepend") {
-			return success(PrependCommand {ItemKey(std::string(key)), flags, exptime, value, noreply}, total_bytes);
+			return success(PrependCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
 		}
-		return success(CasCommand {ItemKey(std::string(key)), flags, exptime, value, cas_unique, noreply}, total_bytes);
+		return success(CasCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), cas_unique, noreply}, total_bytes);
 	}
 
 	OneResult parse_retrieval(std::size_t offset, std::size_t header_bytes, std::string_view name,
@@ -536,7 +560,7 @@ private:
 
 		const std::string_view first_key = cursor.next();
 		if (first_key.empty()) {
-			return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::Continue, header_bytes, offset);
+			return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
 		}
 		if (!valid_key(first_key)) {
 			return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset);
@@ -586,41 +610,28 @@ private:
 	}
 
 	[[nodiscard]] OneResult parse_one(const std::span<const char> input, const std::size_t offset) const {
-		std::size_t line_length = 0;
-		bool has_line = false;
-
-		for (std::size_t i = 0; i < input.size(); ++i) {
-			if (i > limits_.max_command_line_bytes) {
+		// memcached accepts LF and CRLF command lines; value blocks still
+		// require CRLF. memchr uses the libc vectorized scan on the hot path.
+		const auto *newline = static_cast<const char *>(std::memchr(input.data(), '\n', input.size()));
+		if (!newline) {
+			if (input.size() > limits_.max_command_line_bytes) {
 				return failure(ParseErrorCode::CommandLineTooLong, ErrorRecovery::CloseConnection, 0, offset);
 			}
-			if (input[i] == '\n') {
-				return failure(ParseErrorCode::InvalidLineEnding, ErrorRecovery::CloseConnection, 0, offset);
-			}
-			if (input[i] == '\r') {
-				if (i + 1 == input.size()) {
-					return need_more(1);
-				}
-				if (input[i + 1] != '\n') {
-					return failure(ParseErrorCode::InvalidLineEnding, ErrorRecovery::CloseConnection, 0, offset);
-				}
-				line_length = i;
-				has_line = true;
-				break;
-			}
-			if (i == limits_.max_command_line_bytes) {
-				return failure(ParseErrorCode::CommandLineTooLong, ErrorRecovery::CloseConnection, 0, offset);
-			}
-		}
-		if (!has_line) {
 			return need_more(1);
 		}
-
-		const std::size_t header_bytes = line_length + 2;
+		std::size_t line_length = static_cast<std::size_t>(newline - input.data());
+		const std::size_t header_bytes = line_length + 1;
+		if (line_length != 0 && input[line_length - 1] == '\r') {
+			--line_length;
+		}
+		if (line_length > limits_.max_command_line_bytes) {
+			return failure(ParseErrorCode::CommandLineTooLong, ErrorRecovery::CloseConnection, 0, offset);
+		}
 		TokenCursor cursor(std::string_view(input.data(), line_length));
 		const std::string_view name = cursor.next();
 
 		if (name.empty()) {
-			return skip_empty(header_bytes);
+			return failure(ParseErrorCode::UnknownCommand, ErrorRecovery::Continue, header_bytes, offset);
 		}
 		if (name == "set" || name == "add" || name == "replace" || name == "append" || name == "prepend" ||
 		    name == "cas") {
@@ -706,7 +717,7 @@ private:
 			return success(VerbosityCommand {level, noreply}, header_bytes);
 		}
 		if (name == "stats") {
-			return success(StatsCommand {cursor.rest()}, header_bytes);
+			return success(StatsCommand {std::string(cursor.rest())}, header_bytes);
 		}
 		if (name == "version" || name == "quit") {
 			if (!cursor.done()) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <spdlog/spdlog.h>
 #include <cstring>
 #include <vector>
 
@@ -22,6 +23,9 @@ struct TCPSession {
 	RingArray ring_array;
 	uint32_t seq {0};
 	bool closing {false}; // 已决定关闭：不再发送，也不再执行新命令
+	bool protocol_error_waiting {false}; // 致命解析错误已入队，等待有序响应排空后关闭
+	bool session_exited {false}; // session 协程已退出，允许 writer 回收对象
+	std::optional<uint32_t> swallow_seq; // 数据块丢弃完成前，不能发出该序号的错误
 	explicit TCPSession(tcp::socket &&s) : socket(std::move(s)) {
 	}
 };
@@ -127,7 +131,7 @@ public:
 			// 一次可以消费掉多个元素
 			while (mailbox.pop(message)) {
 				try {
-					handle_response_message(message);
+					handle_response_message(std::move(*message));
 				} catch (const std::exception &e) {
 					spdlog::error("[shard {}] mailbox handler exception: {}", shard_id, e.what());
 				} catch (...) {
@@ -142,7 +146,11 @@ public:
 		return shard_comm_.current_shard_id();
 	}
 
-	void send_multi_command(MultiKeyCommand &command, const uint64_t tcp_id) {
+	void send_multi_command(const MultiKeyCommand &command, const uint64_t tcp_id) {
+		auto session_it = tcp_session_.find(tcp_id);
+		if (session_it == tcp_session_.end() || !session_it->second || session_it->second->closing) {
+			return;
+		}
 		const std::vector<ItemKey> &item_keys = command.item_keys();
 		uint16_t counter = 0;
 		for (size_t i = 0; i < item_keys.size(); i++) {
@@ -154,68 +162,112 @@ public:
 				multi_key_index_[shard].value().emplace_back(item_keys[i]);
 			}
 		}
-		const uint32_t seq = tcp_session_[tcp_id]->seq++;
+		const uint32_t seq = session_it->second->seq++;
 
 		for (size_t i = 0; i < multi_key_index_.size(); i++) {
 			if (!multi_key_index_[i].has_value()) {
 				continue;
 			}
-			const auto &key_views = multi_key_index_[i].value();
-			MultiKeyCommand multi_key_command = rebuild(command, key_views);
+			MultiKeyCommand multi_key_command = rebuild(command, std::move(*multi_key_index_[i]));
+			multi_key_index_[i].reset();
+
 			if (shard_comm_.is_current_shard(i)) {
-				// 如果是当前分片，那么就直接处理
-				data_.handle_multi_command(multi_key_command);
-				multi_key_index_[i].reset();
+				// Handle the local shard exactly once; sending it through the
+				// mailbox would duplicate the work and add avoidable latency.
+				MultiKeyResponse response = data_.handle_multi_command(multi_key_command);
+				ResponseMessage response_message = {.tcp_id = tcp_id,
+				                                    .seq = seq,
+				                                    .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+				                                    .data = ResponseData {ShardResponse {.count = counter,
+				                                                                        .command = std::move(response)}}};
+				handle_response_message(std::move(response_message));
+				continue;
 			}
-			MultiKeyRequest request = {.count = counter, .command = multi_key_command};
+
+			MultiKeyRequest request = {.count = counter, .command = std::move(multi_key_command)};
 			RequestMessage request_message = {.tcp_id = tcp_id,
 			                                  .seq = seq,
 			                                  .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-			                                  .data = RequestData {request}};
-			shard_comm_.send_request_to_shard(i, std::make_unique<RequestMessage>(request_message));
-			multi_key_index_[i].reset();
+			                                  .data = RequestData {std::move(request)}};
+			shard_comm_.send_request_to_shard(i, std::make_unique<RequestMessage>(std::move(request_message)));
 		}
 	}
 
-	void send_single_command(SingleKeyCommand &command, const uint64_t tcp_id) {
-		SingleKeyRequest request = {.command = command};
+	void send_single_command(SingleKeyCommand command, const uint64_t tcp_id) {
+		auto session_it = tcp_session_.find(tcp_id);
+		if (session_it == tcp_session_.end() || !session_it->second || session_it->second->closing) {
+			return;
+		}
 		const std::size_t shard = shard_comm_.get_shard(command.item_key().hash);
-		auto seq = tcp_session_[tcp_id]->seq++;
+		const uint32_t seq = session_it->second->seq++;
 		if (shard_comm_.is_current_shard(shard)) {
-			SingleKeyResponse handle_single_command = data_.handle_single_command(command);
-			ResponseMessage response = {.tcp_id = tcp_id,
-			                            .seq = seq,
-			                            .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-			                            .data = ResponseData {handle_single_command}};
-			handle_response_message(std::make_unique<ResponseMessage>(response));
+			auto response = data_.handle_single_command(std::move(command));
+			handle_response_message(ResponseMessage {.tcp_id = tcp_id,
+			                                         .seq = seq,
+			                                         .shard_id = static_cast<uint16_t>(current_shard_id()),
+			                                         .data = ResponseData {std::move(response)}});
 			return;
 		}
 		RequestMessage request_message = {.tcp_id = tcp_id,
 		                                  .seq = seq,
-		                                  .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-		                                  .data = RequestData {request}};
-		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(request_message));
+		                                  .shard_id = static_cast<uint16_t>(current_shard_id()),
+		                                  .data = RequestData {SingleKeyRequest {std::move(command)}}};
+		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(std::move(request_message)));
 	}
 
-	void send_error_command(ErrorResponse &response, const uint64_t tcp_id) {
-		const uint32_t seq = tcp_session_[tcp_id]->seq++;
-		handle_response_message(std::make_unique<ResponseMessage>(
-		    ResponseMessage {.tcp_id = tcp_id,
-		                     .seq = seq,
-		                     .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-		                     .data = {response}}));
+	void send_error_command(ErrorResponse response, const uint64_t tcp_id,
+	                        std::optional<ItemKey> rejected_set_key = std::nullopt,
+	                        const bool wait_for_swallow = false) {
+		auto session_it = tcp_session_.find(tcp_id);
+		if (session_it == tcp_session_.end() || !session_it->second || session_it->second->closing) {
+			return;
+		}
+		const uint32_t seq = session_it->second->seq++;
+		if (wait_for_swallow) {
+			session_it->second->swallow_seq = seq;
+		}
+		if (rejected_set_key) {
+			const std::size_t shard = shard_comm_.get_shard(rejected_set_key->hash);
+			if (!shard_comm_.is_current_shard(shard)) {
+				RequestMessage request {.tcp_id = tcp_id,
+				                        .seq = seq,
+				                        .shard_id = static_cast<uint16_t>(current_shard_id()),
+				                        .data = RejectedSetRequest {std::move(*rejected_set_key), std::move(response)}};
+				shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(std::move(request)));
+				return;
+			}
+			data_.erase_rejected_set(*rejected_set_key);
+		}
+		// Errors use the same ordered response path, without a mailbox hop or
+		// a heap-allocated message on the connection's owning shard.
+		handle_response_message(ResponseMessage {.tcp_id = tcp_id,
+		                                         .seq = seq,
+		                                         .shard_id = static_cast<uint16_t>(current_shard_id()),
+		                                         .data = ResponseData {std::move(response)}});
+	}
+
+	void finish_swallow(const uint64_t tcp_id) {
+		auto it = tcp_session_.find(tcp_id);
+		if (it == tcp_session_.end() || !it->second || it->second->closing) {
+			return;
+		}
+		it->second->swallow_seq.reset();
+		drain_responses(tcp_id, *it->second);
 	}
 
 private:
 	void handle_request_message(const std::unique_ptr<RequestMessage> &message) {
 		auto &cmd = message->data;
 		ResponseData res = std::visit(
-		    [&, this](const auto &c) -> ResponseData {
+		    [&, this](auto &c) -> ResponseData {
 			    using T = std::decay_t<decltype(c)>;
 			    if constexpr (std::is_same_v<T, SingleKeyRequest>) {
-				    return data_.handle_single_command(c.command);
+				    return data_.handle_single_command(std::move(c.command));
 			    } else if constexpr (std::is_same_v<T, MultiKeyRequest>) {
 				    return ShardResponse {.count = c.count, .command = data_.handle_multi_command(c.command)};
+			    } else if constexpr (std::is_same_v<T, RejectedSetRequest>) {
+				    data_.erase_rejected_set(c.key);
+				    return std::move(c.response);
 			    }
 		    },
 		    cmd);
@@ -229,20 +281,31 @@ private:
 	}
 
 	// ---- Worker private ----
-	void handle_response_message(const std::unique_ptr<ResponseMessage> &message) {
-		auto it = tcp_session_.find(message->tcp_id);
+	void handle_response_message(ResponseMessage message) {
+		const uint64_t tcp_id = message.tcp_id;
+		auto it = tcp_session_.find(tcp_id);
 		if (it == tcp_session_.end() || !it->second)
 			return;
 		auto &session = *it->second;
 		if (session.closing)
 			return;                                     // 丢弃迟到响应
-		session.ring_array.append(std::move(*message)); // 顺便省一次拷贝
+		session.ring_array.append(std::move(message)); // 顺便省一次拷贝
+		drain_responses(tcp_id, session);
+	}
+
+	void drain_responses(const uint64_t tcp_id, TCPSession &session) {
 		while (!session.closing) {
+			// memcached queues an oversized object's error while swallowing its
+			// data block. Earlier ready responses may still leave in order.
+			if (session.swallow_seq && *session.swallow_seq == session.ring_array.next_id()) {
+				break;
+			}
 			auto popped = session.ring_array.try_pop();
 			if (!popped)
 				break;
 			if (!send_response(session, popped->data)) {
-				close_session(session);
+				close_session(tcp_id, session);
+				break;
 			}
 		}
 	}
@@ -288,11 +351,17 @@ private:
 		}
 	}
 
-	static void close_session(TCPSession &session) {
+	void close_session(const uint64_t tcp_id, TCPSession &session) {
+		if (session.closing) {
+			return;
+		}
 		session.closing = true;
 		boost::system::error_code ec;
 		session.socket.shutdown(tcp::socket::shutdown_both, ec);
-		session.socket.close(ec); // 唤醒 session() 中的 async_read_some，由它负责 erase
+		session.socket.close(ec); // 唤醒 session() 中的 async_read_some
+		if (session.session_exited) {
+			tcp_session_.erase(tcp_id);
+		}
 	}
 	Sc shard_comm_;
 	ShardCache data_;
