@@ -30,7 +30,7 @@ else:
 
 try:
     # 故意在键名中插入空格，触发 CLIENT_ERROR
-    client.raw_command(b"get my_key extra_token")
+    client.raw_command(b"get")
 except Exception as e:
     print(f"触发 CLIENT_ERROR: {e}")
 

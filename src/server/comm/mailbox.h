@@ -15,22 +15,22 @@
 // 事件只持有指向消息的指针，因此与消息类型无关存储布局
 template <typename Message>
 struct ShardEvent {
-	Message *message{nullptr};
+	Message *message {nullptr};
 };
 
-// constexpr std::size_t kMailboxCapacity = 4096;
+constexpr std::size_t kMailboxCapacity = 1024;
 
 namespace fastest {
 template <typename Message>
 class alignas(64) Mailbox {
-	static_assert(std::is_trivially_copyable_v<ShardEvent<Message> >, "ShardEvent must be trivially copyable");
+	static_assert(std::is_trivially_copyable_v<ShardEvent<Message>>, "ShardEvent must be trivially copyable");
 	// using MailboxQueue = boost::lockfree::mpsc_weak_queue
 	// <ShardEvent<Message>, boost::lockfree::capacity<kMailboxCapacity> >;
-	using MailboxQueue = boost::lockfree::mpsc_weak_queue<ShardEvent<Message> >;
+	using MailboxQueue = boost::lockfree::mpsc_weak_queue<ShardEvent<Message>>;
 
 public:
-	Mailbox() : queue_(1024){
-		event_fd_ = ::eventfd(0,EFD_NONBLOCK | EFD_CLOEXEC);
+	Mailbox() : queue_(kMailboxCapacity) {
+		event_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 		if (event_fd_ < 0) {
 			throw std::system_error(errno, std::generic_category(), "eventfd");
 		}
@@ -40,7 +40,7 @@ public:
 		/*
 		 * 这里仍然把残留消息释放掉，避免 shutdown 时泄漏。
 		 */
-		ShardEvent<Message> ev{};
+		ShardEvent<Message> ev {};
 		while (queue_.pop(ev)) {
 			delete ev.message;
 			ev.message = nullptr;
@@ -51,7 +51,6 @@ public:
 		}
 	}
 
-
 	// 禁止拷贝
 	Mailbox(const Mailbox &) = delete;
 
@@ -61,24 +60,23 @@ public:
 		if (!message) {
 			return false;
 		}
-		ShardEvent<Message> ev{};
+		ShardEvent<Message> ev {};
 		ev.message = message.get();
 		if (!queue_.push(ev)) {
 			return false;
 		}
 		// queue 已经拥有 message。释放对message的所有权 防止delete
 		message.release();
-		//确保notify是在push完成后才发生，不会撞上半完成的pusd
+		// 确保notify是在push完成后才发生，不会撞上半完成的pusd
 		notify();
 		return true;
 	}
-
 
 	/*
 	 * consumer 取得 ownership。
 	 */
 	bool pop(std::unique_ptr<Message> &out) {
-		ShardEvent<Message> ev{};
+		ShardEvent<Message> ev {};
 		if (!queue_.pop(ev)) {
 			return false;
 		}
@@ -97,19 +95,18 @@ public:
 	 */
 	int duplicate_event_fd() const noexcept {
 #ifdef F_DUPFD_CLOEXEC
-		return ::fcntl(event_fd_,F_DUPFD_CLOEXEC, 0);
+		return ::fcntl(event_fd_, F_DUPFD_CLOEXEC, 0);
 #else
 		const int fd = ::dup(event_fd_);
 		if (fd >= 0) {
 			const int flags = ::fcntl(fd, F_GETFD);
 			if (flags >= 0) {
-				::fcntl(fd,F_SETFD,flags | FD_CLOEXEC);
+				::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 			}
 		}
 		return fd;
 #endif
 	}
-
 
 	/*
 	 * eventfd 非 semaphore 模式下，一次 read 会读取整个 counter，并把 counter 清零。
@@ -134,11 +131,11 @@ public:
 	}
 
 private:
-	//通过fd唤醒其他线程来读取队列
+	// 通过fd唤醒其他线程来读取队列
 	void notify() const noexcept {
 		constexpr uint64_t one = 1;
 		while (true) {
-			//给eventfd计数器+1
+			// 给eventfd计数器+1
 			const ssize_t n = ::write(event_fd_, &one, sizeof(one));
 			if (n == static_cast<ssize_t>(sizeof(one))) {
 				return;
@@ -158,6 +155,6 @@ private:
 	}
 
 	MailboxQueue queue_;
-	int event_fd_{-1};
+	int event_fd_ {-1};
 };
-} // namespace comm
+} // namespace fastest

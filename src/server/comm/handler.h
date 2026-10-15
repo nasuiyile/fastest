@@ -157,10 +157,6 @@ private:
 	}
 
 	void run() {
-		/*
-		 * 如果项目其他代码依赖 thread_local shard id，
-		 * 继续保留。
-		 */
 		asio::co_spawn(io_, worker_->mailbox_request_loop(), asio::detached);
 		asio::co_spawn(io_, worker_->mailbox_response_loop(), asio::detached);
 		asio::co_spawn(io_, accept_loop(), asio::detached);
