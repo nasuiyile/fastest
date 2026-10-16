@@ -35,8 +35,10 @@ void run() {
             continue;
     
         // 接受空闲时最多隔 500ms 重新检查清理。
-        io_.run_one_until(std::chrono::steady_clock::now() + 500ms);
+        io_.run_one_until(std::chrono::steady_clock::now() + 50ms);
     }
 }
 ~~~
 因为存在惰性删除，在访问频繁的情况下，数据也会自动被删除，暂时不考虑后台清理线程饿死的问题。
+
+后续考虑引入基数树，当采样到快要过期的数据时，就优先放入基数树，下一次采样迭代时，会直接从这棵记录着“即将过期键”的树开始检查，以此提高清理的命中率。
