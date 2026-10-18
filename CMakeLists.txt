@@ -36,6 +36,7 @@ add_executable(fastest
         src/protocol/memcached_response.h
         src/protocol/memcached_response.h
         src/cache/shard_cache.h
+        src/cache/type.h
 )
 
 target_link_libraries(fastest

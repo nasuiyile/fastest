@@ -8,7 +8,6 @@
 #include <limits>
 #include <optional>
 #include <span>
-#include <functional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -17,20 +16,9 @@
 #include <variant>
 #include <vector>
 
-namespace fastest {
-using Value = std::string;
-using Key = std::string;
-struct ItemKey {
-	uint64_t hash {0};
-	Key key;
+#include "../cache/type.h"
 
-	explicit ItemKey(Key k) : hash(std::hash<Key> {}(k)), key(std::move(k)) {
-	}
-};
-struct Item {
-	uint32_t flags {0};
-	Value value;
-};
+namespace fastest {
 
 // CommandType 保留协议命令名；单 Key / 多 Key 由具体 C++ 类型和外层 variant 区分。
 enum class CommandType : std::uint8_t {
@@ -269,8 +257,8 @@ enum class ErrorRecovery : std::uint8_t {
 struct ParseError {
 	ParseErrorCode code {};
 	ErrorRecovery recovery {};
-	std::size_t offset = 0; // 错误命令起始位置，相对于本次输入
-	bool noreply = false; // 仅在命令头可以可靠识别 noreply 时抑制错误响应
+	std::size_t offset = 0;                  // 错误命令起始位置，相对于本次输入
+	bool noreply = false;                    // 仅在命令头可以可靠识别 noreply 时抑制错误响应
 	std::optional<ItemKey> rejected_set_key; // 过大的 SET 必须在所属分片删除旧值
 };
 
@@ -534,21 +522,27 @@ private:
 
 		std::string value(value_begin, value_bytes);
 		if (name == "set") {
-			return success(SetCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
+			return success(SetCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply},
+			               total_bytes);
 		}
 		if (name == "add") {
-			return success(AddCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
+			return success(AddCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply},
+			               total_bytes);
 		}
 		if (name == "replace") {
-			return success(ReplaceCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
+			return success(ReplaceCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply},
+			               total_bytes);
 		}
 		if (name == "append") {
-			return success(AppendCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
+			return success(AppendCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply},
+			               total_bytes);
 		}
 		if (name == "prepend") {
-			return success(PrependCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply}, total_bytes);
+			return success(PrependCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), noreply},
+			               total_bytes);
 		}
-		return success(CasCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), cas_unique, noreply}, total_bytes);
+		return success(CasCommand {ItemKey(std::string(key)), flags, exptime, std::move(value), cas_unique, noreply},
+		               total_bytes);
 	}
 
 	OneResult parse_retrieval(std::size_t offset, std::size_t header_bytes, std::string_view name,
@@ -733,4 +727,4 @@ private:
 
 	ParserLimits limits_;
 };
-} // namespace comm
+} // namespace fastest

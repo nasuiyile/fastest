@@ -22,9 +22,9 @@ struct TCPSession {
 	tcp::socket socket;
 	RingArray ring_array;
 	uint32_t seq {0};
-	bool closing {false}; // 已决定关闭：不再发送，也不再执行新命令
+	bool closing {false};                // 已决定关闭：不再发送，也不再执行新命令
 	bool protocol_error_waiting {false}; // 致命解析错误已入队，等待有序响应排空后关闭
-	bool session_exited {false}; // session 协程已退出，允许 writer 回收对象
+	bool session_exited {false};         // session 协程已退出，允许 writer 回收对象
 	std::optional<uint32_t> swallow_seq; // 数据块丢弃完成前，不能发出该序号的错误
 	explicit TCPSession(tcp::socket &&s) : socket(std::move(s)) {
 	}
@@ -175,11 +175,11 @@ public:
 				// Handle the local shard exactly once; sending it through the
 				// mailbox would duplicate the work and add avoidable latency.
 				MultiKeyResponse response = data_.handle_multi_command(multi_key_command);
-				ResponseMessage response_message = {.tcp_id = tcp_id,
-				                                    .seq = seq,
-				                                    .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-				                                    .data = ResponseData {ShardResponse {.count = counter,
-				                                                                        .command = std::move(response)}}};
+				ResponseMessage response_message = {
+				    .tcp_id = tcp_id,
+				    .seq = seq,
+				    .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
+				    .data = ResponseData {ShardResponse {.count = counter, .command = std::move(response)}}};
 				handle_response_message(std::move(response_message));
 				continue;
 			}
@@ -289,7 +289,7 @@ private:
 			return;
 		auto &session = *it->second;
 		if (session.closing)
-			return;                                     // 丢弃迟到响应
+			return;                                    // 丢弃迟到响应
 		session.ring_array.append(std::move(message)); // 顺便省一次拷贝
 		drain_responses(tcp_id, session);
 	}
@@ -301,7 +301,7 @@ private:
 			if (session.swallow_seq && *session.swallow_seq == session.ring_array.next_id()) {
 				break;
 			}
-			auto popped = session.ring_array.try_pop();
+			const auto popped = session.ring_array.try_pop();
 			if (!popped)
 				break;
 			if (!send_response(session, popped->data)) {
@@ -343,7 +343,7 @@ private:
 		}
 	}
 
-	bool send_server_error(TCPSession &session) {
+	static bool send_server_error(TCPSession &session) {
 		try {
 			const ErrorResponse err {.kind = ResponseErrorKind::ServerError, .message = "response encoding failed"};
 			return !err.send_to(session.socket).close_connection;

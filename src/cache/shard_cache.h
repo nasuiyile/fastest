@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core_cache.h"
 #include "../server/comm/type.h"
 
 #include <stdexcept>
@@ -52,7 +53,8 @@ private:
 	SetResponse handle_set(SetCommand &&command) {
 		// The parser copies the payload once. Transfer its allocation all the
 		// way into the cache, including when it crossed a shard mailbox.
-		data_.insert_or_assign(std::move(command.key), Item {.flags = command.flags, .value = std::move(command.value)});
+		data_.insert_or_assign(std::move(command.key),
+		                       Item {.flags = command.flags, .value = std::move(command.value)});
 		if (command.noreply) {
 			return SetResponse {StorageStatus::NoReply};
 		}
@@ -84,7 +86,10 @@ private:
 		}
 		return response;
 	}
+
 	std::unordered_map<ItemKey, Item, KeyHash, KeyEqual> data_;
+
+	// IncrementalHashMap<CacheValue> map_;
 };
 
 } // namespace fastest
