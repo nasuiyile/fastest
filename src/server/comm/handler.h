@@ -25,15 +25,14 @@ public:
 		thread_ = std::thread([this] { run(); });
 	}
 
-	static std::vector<std::unique_ptr<Handler> > create_handlers(const Config &cfg) {
+	static std::vector<std::unique_ptr<Handler>> create_handlers(const Config &cfg) {
 		const std::size_t core_num = util::core_num();
 		const auto stop = std::make_shared<std::atomic_bool>(false);
-		auto workers = Worker::create_workers(core_num, stop);
-		std::vector<std::unique_ptr<Handler> > handlers;
-		handlers.reserve(workers.size());
-		for (auto &worker : workers) {
-			handlers.push_back(
-				std::unique_ptr<Handler>(new Handler(cfg, std::make_unique<Worker>(std::move(worker)), stop)));
+		auto shard_comms = Worker::Sc::create_shard_comm(core_num);
+		std::vector<std::unique_ptr<Handler>> handlers;
+		handlers.reserve(shard_comms.size());
+		for (auto &comm : shard_comms) {
+			handlers.push_back(std::unique_ptr<Handler>(new Handler(cfg, std::move(comm), stop)));
 		}
 		return handlers;
 	}
@@ -45,15 +44,16 @@ public:
 	}
 
 private:
-	explicit Handler(Config config, std::unique_ptr<Worker> worker, std::shared_ptr<std::atomic_bool> stop)
-		: config_(std::move(config)), worker_(std::move(worker)), stop_(std::move(stop)) {
+	// Construct the nonmovable Worker directly at its final address.
+	explicit Handler(Config config, Worker::Sc comm, std::shared_ptr<std::atomic_bool> stop)
+	    : config_(std::move(config)), worker_(std::move(comm), stop), stop_(std::move(stop)) {
 	}
 
 	static constexpr std::size_t kReadChunkBytes = 4096;
 
-	bool handle_parse_error(const uint64_t tcp_id, ParseError &error, const bool wait_for_swallow) const {
-		worker_->send_error_command(to_error_response(error), tcp_id, std::move(error.rejected_set_key),
-		                            wait_for_swallow);
+	bool handle_parse_error(const uint64_t tcp_id, ParseError &error, const bool wait_for_swallow) {
+		worker_.send_error_command(to_error_response(error), tcp_id, std::move(error.rejected_set_key),
+		                           wait_for_swallow);
 		return error.recovery == ErrorRecovery::Continue;
 	}
 
@@ -62,34 +62,34 @@ private:
 		// vector avoids copying multi-key command vectors on the hot path.
 		for (Command &command : commands) {
 			std::visit(
-				[this, tcp_id](auto &arg) {
-					using T = std::decay_t<decltype(arg)>;
-					if constexpr (std::is_same_v<T, SingleKeyCommand>) {
-						worker_->send_single_command(std::move(arg), tcp_id);
-					} else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
-						worker_->send_multi_command(arg, tcp_id);
-					} else if constexpr (std::is_same_v<T, NoKeyCommand>) {
-						// No-key commands are not routed through key shards.
-					}
-				},
-				command);
+			    [this, tcp_id](auto &arg) {
+				    using T = std::decay_t<decltype(arg)>;
+				    if constexpr (std::is_same_v<T, SingleKeyCommand>) {
+					    worker_.send_single_command(std::move(arg), tcp_id);
+				    } else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
+					    worker_.send_multi_command(arg, tcp_id);
+				    } else if constexpr (std::is_same_v<T, NoKeyCommand>) {
+					    // No-key commands are not routed through key shards.
+				    }
+			    },
+			    command);
 		}
 	};
 
 	awaitable<void> session(const uint64_t tcp_id) {
-		auto it = worker_->tcp_session_.find(tcp_id);
-		if (it == worker_->tcp_session_.end()) {
+		auto it = worker_.tcp_session_.find(tcp_id);
+		if (it == worker_.tcp_session_.end()) {
 			co_return;
 		}
 		TCPSession &tcp_session = *it->second;
 		tcp::socket &socket = tcp_session.socket;
-		std::size_t shard_id = worker_->current_shard_id();
+		std::size_t shard_id = worker_.current_shard_id();
 		try {
 			const MemcachedParser parser;
 			// 保留上一次没有解析完的数据
 			std::string input;
-			std::array<char, kReadChunkBytes> recv_buffer{};
-			//需要丢弃的字节
+			std::array<char, kReadChunkBytes> recv_buffer {};
+			// 需要丢弃的字节
 			std::size_t discard_remaining = 0;
 			while (!tcp_session.closing && !stop_->load(std::memory_order_relaxed)) {
 				if (discard_remaining != 0) {
@@ -97,7 +97,7 @@ private:
 					input.erase(0, buffered);
 					discard_remaining -= buffered;
 					if (discard_remaining == 0) {
-						worker_->finish_swallow(tcp_id);
+						worker_.finish_swallow(tcp_id);
 						continue;
 					}
 					const std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
@@ -107,7 +107,7 @@ private:
 						input.append(recv_buffer.data() + dropped, n - dropped);
 					}
 					if (discard_remaining == 0) {
-						worker_->finish_swallow(tcp_id);
+						worker_.finish_swallow(tcp_id);
 					}
 					continue;
 				}
@@ -152,19 +152,19 @@ private:
 		// ring. Keep the session object until the ordered writer closes it.
 		tcp_session.session_exited = true;
 		if (!tcp_session.protocol_error_waiting || tcp_session.closing) {
-			worker_->tcp_session_.erase(tcp_id);
+			worker_.tcp_session_.erase(tcp_id);
 		}
 	}
 
 	void run() {
-		asio::co_spawn(io_, worker_->mailbox_request_loop(), asio::detached);
-		asio::co_spawn(io_, worker_->mailbox_response_loop(), asio::detached);
+		asio::co_spawn(io_, worker_.mailbox_request_loop(), asio::detached);
+		asio::co_spawn(io_, worker_.mailbox_response_loop(), asio::detached);
 		asio::co_spawn(io_, accept_loop(), asio::detached);
 		io_.run();
 	}
 
 	awaitable<void> accept_loop() {
-		const std::size_t shard_id = worker_->current_shard_id();
+		const std::size_t shard_id = worker_.current_shard_id();
 		const auto executor = co_await asio::this_coro::executor;
 		boost::system::error_code ec;
 		const auto address = asio::ip::make_address(config_.addr, ec);
@@ -203,13 +203,13 @@ private:
 			}
 			auto ptr = std::make_unique<TCPSession>(std::move(socket));
 			uint64_t id = tcp_id_++;
-			worker_->tcp_session_.emplace(id, std::move(ptr));
+			worker_.tcp_session_.emplace(id, std::move(ptr));
 			asio::co_spawn(executor, session(id), asio::detached);
 		}
 	}
 
 	// 每次收到TCP都分配一个新版本号
-	uint64_t tcp_id_{0};
+	uint64_t tcp_id_ {0};
 
 	std::thread thread_;
 
@@ -217,7 +217,7 @@ private:
 
 	Config config_;
 
-	std::unique_ptr<Worker> worker_;
+	Worker worker_;
 
 	std::shared_ptr<std::atomic_bool> stop_;
 };

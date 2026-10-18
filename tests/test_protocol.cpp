@@ -3,6 +3,7 @@
 #include "protocol/memcached_parser.h"
 #include "server/comm/worker.h"
 
+#include <array>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -24,12 +25,18 @@ std::string shard_key(std::size_t shard) {
 	}
 }
 
+// Prvalue elements construct directly in the array; Worker need not be movable.
+std::array<Worker, 2> make_test_workers(const std::shared_ptr<std::atomic_bool> &stop) {
+	auto comms = Worker::Sc::create_shard_comm(2);
+	return {Worker(std::move(comms[0]), stop), Worker(std::move(comms[1]), stop)};
+}
+
 // Mailboxes start only after commands/errors have been queued. This makes the
 // dangerous ordering deterministic: local errors arrive before remote replies.
 struct WorkerFixture {
 	asio::io_context io;
 	std::shared_ptr<std::atomic_bool> stop = std::make_shared<std::atomic_bool>(false);
-	std::vector<Worker> workers = Worker::create_workers(2, stop);
+	std::array<Worker, 2> workers = make_test_workers(stop);
 	tcp::socket client {io};
 	static constexpr uint64_t id = 42;
 

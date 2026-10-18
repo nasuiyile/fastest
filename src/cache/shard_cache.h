@@ -89,7 +89,7 @@ private:
 
 	std::unordered_map<ItemKey, Item, KeyHash, KeyEqual> data_;
 
-	// IncrementalHashMap<CacheValue> map_;
+	IncrementalHashMap<CacheValue> map_;
 };
 
 } // namespace fastest

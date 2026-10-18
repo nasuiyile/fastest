@@ -56,18 +56,6 @@ public:
 	    : shard_comm_(std::move(shard_comm)), multi_key_index_(shard_comm_.shard_num()), stop_(std::move(stop)) {
 	}
 
-	static std::vector<Worker> create_workers(const std::size_t core_num,
-	                                          const std::shared_ptr<std::atomic_bool> &stop) {
-		std::vector<Sc> shard_comm = Sc::create_shard_comm(core_num);
-		// 所有 Worker 共享同一个 stop
-		std::vector<Worker> workers;
-		workers.reserve(core_num);
-		for (Sc &comm : shard_comm) {
-			workers.emplace_back(std::move(comm), stop);
-		}
-		return workers;
-	}
-
 	// 接收他人请求
 	awaitable<void> mailbox_request_loop() {
 		std::size_t shard_id = shard_comm_.current_shard_id();
