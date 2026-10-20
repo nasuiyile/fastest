@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import select
 import subprocess
+import threading
 import time
 
 
@@ -127,6 +128,103 @@ def fatal_case(port):
     print("PASS configured fatal line limit drains prefix before EOF")
 
 
+def pipeline_cases(port):
+    # 读写互不等待：写由回调驱动，mailbox 不等 socket。只发不读的慢连接不能拖住同分片的其他连接。
+    big = b"x" * (1 << 20)
+    with connect(port) as sock:
+        for i in range(8):
+            sock.sendall(b"set big%d 0 0 %d\r\n" % (i, len(big)) + big + b"\r\n")
+            expect(sock, b"STORED\r\n")
+            sock.sendall(b"set small%d 0 0 1\r\nv\r\n" % i)
+            expect(sock, b"STORED\r\n")
+    slow = []
+    try:
+        for _ in range(4):
+            sock = connect(port)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.sendall((b"get " + b" ".join(b"big%d" % i for i in range(8)) + b"\r\n") * 20)
+            slow.append(sock)
+        time.sleep(0.5)
+        for _ in range(8):
+            with connect(port) as sock:
+                sock.settimeout(2)
+                for i in range(8):
+                    sock.sendall(b"get small%d\r\n" % i)
+                    expect(sock, b"VALUE small%d 0 1\r\nv\r\nEND\r\n" % i)
+    finally:
+        for sock in slow:
+            sock.close()
+    print("PASS slow readers do not stall other connections")
+
+    # 大小响应混合、跨分片和本分片混合，并且客户端先不读：响应字节流不能交错。
+    values = {b"mix%d" % i: (bytes([65 + i]) * (512 * 1024 if i % 2 == 0 else 16)) for i in range(8)}
+    with connect(port) as sock:
+        sock.settimeout(20)
+        for key, value in values.items():
+            sock.sendall(b"set " + key + b" 0 0 %d\r\n" % len(value) + value + b"\r\n")
+            expect(sock, b"STORED\r\n")
+        order = [b"mix%d" % (i % 8) for i in range(600)]
+
+        def sender():
+            sock.sendall(b"".join(b"get " + key + b"\r\n" for key in order[:200]))
+            for key in order[200:]:
+                sock.sendall(b"get " + key + b"\r\n")
+                time.sleep(0.002)
+
+        thread = threading.Thread(target=sender)
+        thread.start()
+        time.sleep(1)
+        for key in order:
+            expect(sock, b"VALUE " + key + b" 0 %d\r\n" % len(values[key]) + values[key] + b"\r\nEND\r\n")
+        thread.join()
+    print("PASS mixed large/small pipelined responses stay byte-exact")
+
+    # 背压：客户端只发不读时，积压超过高水位后服务端暂停读取；客户端开始读之后全部响应按序到达。
+    with connect(port) as sock:
+        sock.sendall(b"set bp 0 0 1\r\nv\r\n")
+        expect(sock, b"STORED\r\n")
+        count = 4_000_000
+        request = b"get bp\r\n" * count
+        sock.setblocking(False)
+        sent = 0
+
+        def push(seconds):
+            nonlocal sent
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline and sent < len(request):
+                try:
+                    sent += sock.send(request[sent:sent + (1 << 20)])
+                except BlockingIOError:
+                    time.sleep(0.01)
+
+        # 等到某个 0.5s 窗口内一个字节都发不出去：说明服务端已停止读取（Debug 构建较慢，所以多给几轮）。
+        stalled = False
+        for _ in range(20):
+            before = sent
+            push(0.5)
+            if sent == before:
+                stalled = True
+                break
+        assert stalled and sent < len(request), f"server kept reading ({sent} of {len(request)} bytes) without the client reading"
+        reply = b"VALUE bp 0 1\r\nv\r\nEND\r\n"
+        received, total = 0, len(reply) * count
+        while received < total:
+            readable, writable, _ = select.select([sock], [sock] if sent < len(request) else [], [], 5)
+            assert readable or writable, f"stalled after {received} of {total} bytes"
+            if writable:
+                try:
+                    sent += sock.send(request[sent:sent + (1 << 20)])
+                except BlockingIOError:
+                    pass
+            if readable:
+                chunk = sock.recv(1 << 20)
+                assert chunk, "early EOF"
+                start = received % len(reply)
+                assert chunk == (reply * (len(chunk) // len(reply) + 2))[start:start + len(chunk)], "corrupted reply stream"
+                received += len(chunk)
+    print("PASS backpressure pauses reading until the client reads")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
@@ -135,6 +233,7 @@ if __name__ == "__main__":
     with running([str(args.server.resolve())], 2333) as port:
         wire_cases(port)
         fatal_case(port)
+        pipeline_cases(port)
     if args.reference:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))

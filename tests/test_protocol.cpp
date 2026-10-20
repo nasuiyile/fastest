@@ -270,3 +270,58 @@ TEST_CASE("multi-get waits for all shards before a subsequent parse error", "[pr
 	REQUIRE(f.read(expected.size()) == expected);
 	REQUIRE(f.session().ring_array.next_id() == 4);
 }
+
+TEST_CASE("GatherSink copies short fields contiguously and references long values", "[protocol]") {
+	const std::string big(4096, 'x');
+	const SingleKeyResponse small {SingleGetResponse {.item = ValueItem {"k", 3, "v"}}};
+	const SingleKeyResponse large {SingleGetResponse {.item = ValueItem {"big", 0, big}}};
+	GatherSink out;
+	REQUIRE_FALSE(encode_to(out, small));
+	REQUIRE_FALSE(encode_to(out, large));
+	const auto buffers = out.buffers();
+	// 两条响应的协议文本合并成一段，长 value 单独一段且直接引用原字符串。
+	REQUIRE(buffers.size() == 3);
+	REQUIRE(buffers[1].data() == std::get<SingleGetResponse>(large.variant()).item->value.data());
+	std::string wire;
+	for (const auto &buffer : buffers) {
+		wire.append(static_cast<const char *>(buffer.data()), buffer.size());
+	}
+	REQUIRE(wire == "VALUE k 3 1\r\nv\r\nEND\r\nVALUE big 0 4096\r\n" + big + "\r\nEND\r\n");
+	REQUIRE(out.size_bytes() == wire.size());
+	out.clear();
+	REQUIRE(out.empty());
+}
+
+TEST_CASE("GatherSink rollback drops a half-encoded response", "[protocol]") {
+	const SingleKeyResponse stored {SetResponse {}};
+	const MultiKeyResponse bad {MultiGetResponse {.items = {ValueItem {"a", 0, "1"}, ValueItem {"bad key", 0, "2"}}}};
+	GatherSink out;
+	REQUIRE_FALSE(encode_to(out, stored));
+	const auto mark = out.mark();
+	REQUIRE_THROWS_AS(encode_to(out, bad), std::invalid_argument); // 第一项已经追加，第二项校验失败
+	out.rollback(mark);
+	REQUIRE_FALSE(encode_to(out, ErrorResponse {ResponseErrorKind::ServerError, "response encoding failed"}));
+	std::string wire;
+	for (const auto &buffer : out.buffers()) {
+		wire.append(static_cast<const char *>(buffer.data()), buffer.size());
+	}
+	REQUIRE(wire == "STORED\r\nSERVER_ERROR response encoding failed\r\n");
+}
+
+TEST_CASE("responses that become ready during a write leave together as the next batch", "[protocol]") {
+	WorkerFixture f;
+	const auto key = shard_key(0);
+	f.set(key, "v"); // 本分片：立即开始第一次写
+	REQUIRE(f.session().writing);
+	REQUIRE(f.session().inflight.size() == 1);
+	f.get(key);
+	f.get(key);
+	f.get(key); // 写在途：只入队，不等待
+	REQUIRE(f.session().inflight.size() == 1);
+	REQUIRE(f.session().backlog() == 3);
+	f.until([&] { return f.session().inflight.size() == 3; }); // 第一次写完成后，三条合成一次写
+	REQUIRE(f.session().backlog() == 0);
+	const std::string reply = "VALUE " + key + " 0 1\r\nv\r\nEND\r\n";
+	REQUIRE(f.read(8 + 3 * reply.size()) == "STORED\r\n" + reply + reply + reply);
+	f.until([&] { return !f.session().writing; });
+}

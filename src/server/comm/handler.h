@@ -112,6 +112,13 @@ private:
 					continue;
 				}
 
+				// 背压：读和写互不等待，客户端只发不读时积压会一直增长；超过高水位先暂停解析和读取，
+				// 等写回调把积压降到低水位以下。丢弃数据块的路径不受影响，否则 swallow 永远完不成。
+				if (tcp_session.backlog() >= TCPSession::kPauseReadBacklog) {
+					co_await wait_for_backlog(tcp_session);
+					continue;
+				}
+
 				auto result = parser.parse(std::span(input.data(), input.size()), 128);
 				// 先执行成功解析的命令，确保响应顺序正确
 				execute_batch(result.commands, tcp_id);
@@ -133,6 +140,9 @@ private:
 					// 继续解析剩余缓冲区
 					continue;
 				}
+				if (tcp_session.closing) {
+					break; // 写路径已关闭连接（发送失败或 Quit），不再读
+				}
 				// NeedMoreData 或 EndOfInput
 				const std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
 				input.append(recv_buffer.data(), n);
@@ -151,9 +161,18 @@ private:
 		// A fatal parse error may still have earlier cross-shard responses in the
 		// ring. Keep the session object until the ordered writer closes it.
 		tcp_session.session_exited = true;
-		if (!tcp_session.protocol_error_waiting || tcp_session.closing) {
-			worker_.tcp_session_.erase(tcp_id);
+		// 有写在途时不能回收（inflight 还被引用），由写回调结束时回收。
+		worker_.reclaim_session_if_idle(tcp_id, tcp_session);
+	}
+
+	awaitable<void> wait_for_backlog(TCPSession &session) {
+		session.read_paused = true;
+		while (!session.closing && !stop_->load(std::memory_order_relaxed) &&
+		       session.backlog() > TCPSession::kResumeReadBacklog) {
+			boost::system::error_code ec; // 被 cancel() 唤醒时是 operation_aborted
+			co_await session.resume_read.async_wait(asio::redirect_error(use_awaitable, ec));
 		}
+		session.read_paused = false;
 	}
 
 	void run() {
@@ -201,6 +220,8 @@ private:
 				spdlog::warn("[shard {}] accept failed: {}", shard_id, ec.message());
 				continue;
 			}
+			// 响应已经在 kick_write 里按批合并，不需要 Nagle；否则批次末尾的小段会和客户端的延迟 ACK 互相等待约 40ms。
+			socket.set_option(tcp::no_delay(true), ec);
 			auto ptr = std::make_unique<TCPSession>(std::move(socket));
 			uint64_t id = tcp_id_++;
 			worker_.tcp_session_.emplace(id, std::move(ptr));
