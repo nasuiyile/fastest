@@ -204,6 +204,10 @@ struct MultiKeyCommand {
 	[[nodiscard]] const std::vector<ItemKey> &item_keys() const {
 		return std::visit([](const auto &value) -> const std::vector<ItemKey> & { return value.keys; }, command);
 	}
+
+	[[nodiscard]] std::vector<ItemKey> &item_keys() {
+		return std::visit([](auto &value) -> std::vector<ItemKey> & { return value.keys; }, command);
+	}
 	[[nodiscard]] CommandType command_type() const noexcept {
 		return std::visit(
 		    [](const auto &value) noexcept -> CommandType {

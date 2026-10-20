@@ -4,6 +4,7 @@
 #include <array>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <span>
@@ -15,43 +16,45 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <boost/asio/awaitable.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
 
 namespace fastest {
 
-// C++20 + Boost.Asio。send_to() 是同步发送接口，socket 必须由调用方独占写入。
+// C++20 + Boost.Asio。send_to()/send_batch() 返回 awaitable，调用方必须 co_await。
+// 在整个发送完成前，socket 必须由调用方独占写入；socket 和响应对象必须保持有效。
 enum class ResponseType : std::uint8_t {
-	Set,
-	Add,
-	Replace,
-	Append,
-	Prepend,
-	Cas,
-	Get,
-	Gets,
-	Gat,
-	Gats,
-	Delete,
-	Touch,
-	Incr,
-	Decr,
-	FlushAll,
-	Verbosity,
-	Stats,
-	Version,
-	Quit,
-	Error,
-	NoReply
+    Set,
+    Add,
+    Replace,
+    Append,
+    Prepend,
+    Cas,
+    Get,
+    Gets,
+    Gat,
+    Gats,
+    Delete,
+    Touch,
+    Incr,
+    Decr,
+    FlushAll,
+    Verbosity,
+    Stats,
+    Version,
+    Quit,
+    Error,
+    NoReply
 };
 
 enum class StorageStatus : std::uint8_t { Stored, NotStored, NoReply };
 
-template <ResponseType Type>
-struct StorageResponseT {
-	static constexpr ResponseType response_type = Type;
-	StorageStatus status = StorageStatus::Stored;
+template <ResponseType Type> struct StorageResponseT {
+    static constexpr ResponseType response_type = Type;
+    StorageStatus status = StorageStatus::Stored;
 };
 
 using SetResponse = StorageResponseT<ResponseType::Set>;
@@ -63,34 +66,33 @@ using PrependResponse = StorageResponseT<ResponseType::Prepend>;
 enum class CasStatus : std::uint8_t { Stored, Exists, NotFound, NoReply };
 
 struct CasResponse {
-	static constexpr ResponseType response_type = ResponseType::Cas;
-	CasStatus status = CasStatus::Stored;
+    static constexpr ResponseType response_type = ResponseType::Cas;
+    CasStatus status = CasStatus::Stored;
 };
 
-// Response 持有字符串；发送过程中不复制 key/value，也不能修改或销毁它们。
+// Response 持有字符串；从创建发送任务到 co_await 完成，不能修改、移动或销毁响应及 key/value。
+// 发送时仅引用原始 key/value，不创建它们的副本。
 struct ValueItem {
-	std::string key;
-	std::uint32_t flags = 0;
-	std::string value;
+    std::string key;
+    std::uint32_t flags = 0;
+    std::string value;
 };
 
 struct CasValueItem {
-	std::string key;
-	std::uint32_t flags = 0;
-	std::string value;
-	std::uint64_t cas_unique = 0;
+    std::string key;
+    std::uint32_t flags = 0;
+    std::string value;
+    std::uint64_t cas_unique = 0;
 };
 
-template <ResponseType Type, typename Item>
-struct SingleRetrievalResponseT {
-	static constexpr ResponseType response_type = Type;
-	std::optional<Item> item;
+template <ResponseType Type, typename Item> struct SingleRetrievalResponseT {
+    static constexpr ResponseType response_type = Type;
+    std::optional<Item> item;
 };
 
-template <ResponseType Type, typename Item>
-struct MultiRetrievalResponseT {
-	static constexpr ResponseType response_type = Type;
-	std::vector<Item> items;
+template <ResponseType Type, typename Item> struct MultiRetrievalResponseT {
+    static constexpr ResponseType response_type = Type;
+    std::vector<Item> items;
 };
 
 using SingleGetResponse = SingleRetrievalResponseT<ResponseType::Get, ValueItem>;
@@ -106,25 +108,24 @@ using MultiGatsResponse = MultiRetrievalResponseT<ResponseType::Gats, CasValueIt
 enum class DeleteStatus : std::uint8_t { Deleted, NotFound, NoReply };
 
 struct DeleteResponse {
-	static constexpr ResponseType response_type = ResponseType::Delete;
-	DeleteStatus status = DeleteStatus::Deleted;
+    static constexpr ResponseType response_type = ResponseType::Delete;
+    DeleteStatus status = DeleteStatus::Deleted;
 };
 
 enum class TouchStatus : std::uint8_t { Touched, NotFound, NoReply };
 
 struct TouchResponse {
-	static constexpr ResponseType response_type = ResponseType::Touch;
-	TouchStatus status = TouchStatus::Touched;
+    static constexpr ResponseType response_type = ResponseType::Touch;
+    TouchStatus status = TouchStatus::Touched;
 };
 
 // Reply 时 value 有值输出数值，无值输出 NOT_FOUND；NoReply 时忽略 value。
 enum class ArithmeticStatus : std::uint8_t { Reply, NoReply };
 
-template <ResponseType Type>
-struct ArithmeticResponseT {
-	static constexpr ResponseType response_type = Type;
-	std::optional<std::uint64_t> value;
-	ArithmeticStatus status = ArithmeticStatus::Reply;
+template <ResponseType Type> struct ArithmeticResponseT {
+    static constexpr ResponseType response_type = Type;
+    std::optional<std::uint64_t> value;
+    ArithmeticStatus status = ArithmeticStatus::Reply;
 };
 
 using IncrResponse = ArithmeticResponseT<ResponseType::Incr>;
@@ -133,38 +134,38 @@ using DecrResponse = ArithmeticResponseT<ResponseType::Decr>;
 enum class OkStatus : std::uint8_t { Ok, NoReply };
 
 struct FlushAllResponse {
-	static constexpr ResponseType response_type = ResponseType::FlushAll;
-	OkStatus status = OkStatus::Ok;
+    static constexpr ResponseType response_type = ResponseType::FlushAll;
+    OkStatus status = OkStatus::Ok;
 };
 
 struct VerbosityResponse {
-	static constexpr ResponseType response_type = ResponseType::Verbosity;
-	OkStatus status = OkStatus::Ok;
+    static constexpr ResponseType response_type = ResponseType::Verbosity;
+    OkStatus status = OkStatus::Ok;
 };
 
 enum class StatsLineType : std::uint8_t { Stat, Item, Prefix };
 
 struct StatsLine {
-	StatsLineType type = StatsLineType::Stat;
-	std::string key;
-	std::string value;
+    StatsLineType type = StatsLineType::Stat;
+    std::string key;
+    std::string value;
 };
 
 enum class StatsTerminator : std::uint8_t { End, Reset, Ok };
 
 struct StatsResponse {
-	static constexpr ResponseType response_type = ResponseType::Stats;
-	std::vector<StatsLine> lines;
-	StatsTerminator terminator = StatsTerminator::End;
+    static constexpr ResponseType response_type = ResponseType::Stats;
+    std::vector<StatsLine> lines;
+    StatsTerminator terminator = StatsTerminator::End;
 };
 
 struct VersionResponse {
-	static constexpr ResponseType response_type = ResponseType::Version;
-	std::string version;
+    static constexpr ResponseType response_type = ResponseType::Version;
+    std::string version;
 };
 
 struct QuitResponse {
-	static constexpr ResponseType response_type = ResponseType::Quit;
+    static constexpr ResponseType response_type = ResponseType::Quit;
 };
 
 enum class ResponseErrorKind : std::uint8_t { Error, ClientError, ServerError };
@@ -172,653 +173,768 @@ enum class ResponseErrorKind : std::uint8_t { Error, ClientError, ServerError };
 struct SendResult;
 
 struct ErrorResponse {
-	static constexpr ResponseType response_type = ResponseType::Error;
-	ResponseErrorKind kind = ResponseErrorKind::Error;
-	std::string message;
-	bool close_connection = false;
-	bool noreply = false;
+    static constexpr ResponseType response_type = ResponseType::Error;
+    ResponseErrorKind kind = ResponseErrorKind::Error;
+    std::string message;
+    bool close_connection = false;
+    bool noreply = false;
 
-	// 错误响应是 Response 的独立分支，也支持直接发送；复用统一的协议编码及固定容量发送器。
-	[[nodiscard]] SendResult send_to(boost::asio::ip::tcp::socket &socket) const;
+    // 异步发送；响应对象必须存活至 co_await 完成。
+    [[nodiscard]] boost::asio::awaitable<SendResult> send_to(boost::asio::ip::tcp::socket &socket) const;
 };
 
-// 将解析错误转换为可直接 send_to(socket) 或放入 ResponseBatch 的响应。
+// 将解析错误转换为可直接 co_await send_to(socket) 或放入 ResponseBatch 的响应。
 // 未知命令使用协议规定的 ERROR；对象过大使用可恢复的 SERVER_ERROR，其他错误使用 CLIENT_ERROR。
 [[nodiscard]] inline ErrorResponse to_error_response(const ParseError &error) {
-	ErrorResponse response;
-	response.kind = ResponseErrorKind::ClientError;
-	response.close_connection = error.recovery == ErrorRecovery::CloseConnection;
-	response.noreply = error.noreply;
-	switch (error.code) {
-	case ParseErrorCode::BadArgumentCount:
-	case ParseErrorCode::UnknownCommand:
-		response.kind = ResponseErrorKind::Error;
-		response.message = "unknown command";
-		break;
-	case ParseErrorCode::BadCommandLine:
-		response.message = "bad command line format";
-		break;
-	case ParseErrorCode::InvalidKey:
-		response.message = "bad command line format";
-		break;
-	case ParseErrorCode::InvalidNumber:
-		response.message = "bad command line format";
-		break;
-	case ParseErrorCode::ValueTooLarge:
-		// The session swallows the declared data block before parsing again.
-		response.kind = ResponseErrorKind::ServerError;
-		response.message = "object too large for cache";
-		break;
-	case ParseErrorCode::BadDataChunk:
-		response.message = "bad data chunk";
-		break;
-	case ParseErrorCode::TooManyKeys:
-		response.message = "too many keys";
-		break;
-	case ParseErrorCode::CommandLineTooLong:
-		response.message = "command line too long";
-		break;
-	case ParseErrorCode::InvalidLineEnding:
-		response.message = "invalid line ending";
-		break;
-	default:
-		response.kind = ResponseErrorKind::ServerError;
-		response.message = "unknown parse error code";
-		response.close_connection = true;
-		break;
-	}
-	return response;
+    ErrorResponse response;
+    response.kind = ResponseErrorKind::ClientError;
+    response.close_connection = error.recovery == ErrorRecovery::CloseConnection;
+    response.noreply = error.noreply;
+    switch (error.code) {
+    case ParseErrorCode::BadArgumentCount:
+    case ParseErrorCode::UnknownCommand:
+        response.kind = ResponseErrorKind::Error;
+        response.message = "unknown command";
+        break;
+    case ParseErrorCode::BadCommandLine:
+    case ParseErrorCode::InvalidKey:
+    case ParseErrorCode::InvalidNumber:
+        response.message = "bad command line format";
+        break;
+    case ParseErrorCode::ValueTooLarge:
+        // The session swallows the declared data block before parsing again.
+        response.kind = ResponseErrorKind::ServerError;
+        response.message = "object too large for cache";
+        break;
+    case ParseErrorCode::BadDataChunk:
+        response.message = "bad data chunk";
+        break;
+    case ParseErrorCode::TooManyKeys:
+        response.message = "too many keys";
+        break;
+    case ParseErrorCode::CommandLineTooLong:
+        response.message = "command line too long";
+        break;
+    case ParseErrorCode::InvalidLineEnding:
+        response.message = "invalid line ending";
+        break;
+    default:
+        response.kind = ResponseErrorKind::ServerError;
+        response.message = "unknown parse error code";
+        response.close_connection = true;
+        break;
+    }
+    return response;
 }
 
 struct NoReplyResponse {
-	static constexpr ResponseType response_type = ResponseType::NoReply;
+    static constexpr ResponseType response_type = ResponseType::NoReply;
 };
 
 struct SendResult {
-	std::size_t bytes_sent = 0;
-	// 已处理的响应对象数，包含 NoReply 和 Quit，不等于实际输出的协议响应数。
-	std::size_t responses_sent = 0;
-	bool close_connection = false;
+    std::size_t bytes_sent = 0;
+    // 已处理的响应对象数，包含 NoReply 和 Quit，不等于实际输出的协议响应数。
+    std::size_t responses_sent = 0;
+    bool close_connection = false;
 };
 
 namespace detail {
 
-template <typename Variant>
-SendResult send_group(boost::asio::ip::tcp::socket &socket, const Variant &group);
+template <typename Variant> boost::asio::awaitable<SendResult> send_group(boost::asio::ip::tcp::socket &socket, const Variant &group);
 
 } // namespace detail
 
 // std::variant 的别名不能增加成员方法，因此使用公开继承的薄包装；不增加数据成员。
-template <typename... Types>
-class SocketResponseGroup : public std::variant<Types...> {
-public:
-	using Variant = std::variant<Types...>;
-	using Variant::Variant;
-	using Variant::operator=;
+template <typename... Types> class SocketResponseGroup : public std::variant<Types...> {
+  public:
+    using Variant = std::variant<Types...>;
+    using Variant::Variant;
+    using Variant::operator=;
 
-	Variant &variant() noexcept {
-		return *this;
-	}
-	const Variant &variant() const noexcept {
-		return *this;
-	}
+    Variant &variant() noexcept {
+        return *this;
+    }
+    const Variant &variant() const noexcept {
+        return *this;
+    }
 
-	// 正常返回表示整个响应已写完；网络错误抛出 boost::system::system_error。
-	// close_connection 仅通知调用方关闭连接，方法自身不会关闭 socket。
-	// [[nodiscard]]
-	SendResult send_to(boost::asio::ip::tcp::socket &socket) const {
-		return detail::send_group(socket, variant());
-	}
+    // co_await 正常返回表示整个响应已写完；网络错误抛出 boost::system::system_error。
+    // close_connection 仅通知调用方关闭连接，方法自身不会关闭 socket。
+    [[nodiscard]] boost::asio::awaitable<SendResult> send_to(boost::asio::ip::tcp::socket &socket) const {
+        return detail::send_group(socket, variant());
+    }
 };
 
 using SingleKeyResponse =
-    SocketResponseGroup<SetResponse, AddResponse, ReplaceResponse, AppendResponse, PrependResponse, CasResponse,
-                        SingleGetResponse, SingleGetsResponse, SingleGatResponse, SingleGatsResponse, DeleteResponse,
-                        TouchResponse, IncrResponse, DecrResponse>;
+    SocketResponseGroup<SetResponse, AddResponse, ReplaceResponse, AppendResponse, PrependResponse, CasResponse, SingleGetResponse,
+                        SingleGetsResponse, SingleGatResponse, SingleGatsResponse, DeleteResponse, TouchResponse, IncrResponse, DecrResponse>;
 
 using MultiKeyResponse = SocketResponseGroup<MultiGetResponse, MultiGetsResponse, MultiGatResponse, MultiGatsResponse>;
 
-using NoKeyResponse = SocketResponseGroup<FlushAllResponse, VerbosityResponse, StatsResponse, VersionResponse,
-                                          QuitResponse, NoReplyResponse>;
+using NoKeyResponse = SocketResponseGroup<FlushAllResponse, VerbosityResponse, StatsResponse, VersionResponse, QuitResponse, NoReplyResponse>;
 
 // 错误可能来自任何命令，独立于正常响应的 key 分类。
 using Response = std::variant<SingleKeyResponse, MultiKeyResponse, NoKeyResponse, ErrorResponse>;
 using ResponseBatch = std::vector<Response>;
 
-template <typename T>
-Response make_response(T value) {
-	if constexpr (std::is_same_v<T, ErrorResponse>) {
-		return Response(std::in_place_type<ErrorResponse>, std::move(value));
-	} else if constexpr (std::is_constructible_v<SingleKeyResponse, T>) {
-		return Response(std::in_place_type<SingleKeyResponse>, std::move(value));
-	} else if constexpr (std::is_constructible_v<MultiKeyResponse, T>) {
-		return Response(std::in_place_type<MultiKeyResponse>, std::move(value));
-	} else {
-		static_assert(std::is_constructible_v<NoKeyResponse, T>, "unsupported response type");
-		return Response(std::in_place_type<NoKeyResponse>, std::move(value));
-	}
+template <typename T> Response make_response(T value) {
+    if constexpr (std::is_same_v<T, ErrorResponse>) {
+        return Response(std::in_place_type<ErrorResponse>, std::move(value));
+    } else if constexpr (std::is_constructible_v<SingleKeyResponse, T>) {
+        return Response(std::in_place_type<SingleKeyResponse>, std::move(value));
+    } else if constexpr (std::is_constructible_v<MultiKeyResponse, T>) {
+        return Response(std::in_place_type<MultiKeyResponse>, std::move(value));
+    } else {
+        static_assert(std::is_constructible_v<NoKeyResponse, T>, "unsupported response type");
+        return Response(std::in_place_type<NoKeyResponse>, std::move(value));
+    }
 }
 
 inline ResponseType response_type(const Response &response) {
-	return std::visit(
-	    [](const auto &value) -> ResponseType {
-		    using T = std::remove_cvref_t<decltype(value)>;
-		    if constexpr (std::is_same_v<T, ErrorResponse>) {
-			    return T::response_type;
-		    } else {
-			    return std::visit(
-			        [](const auto &concrete) { return std::remove_cvref_t<decltype(concrete)>::response_type; },
-			        value.variant());
-		    }
-	    },
-	    response);
+    return std::visit(
+        [](const auto &value) -> ResponseType {
+            using T = std::remove_cvref_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, ErrorResponse>) {
+                return T::response_type;
+            } else {
+                return std::visit([](const auto &concrete) { return std::remove_cvref_t<decltype(concrete)>::response_type; }, value.variant());
+            }
+        },
+        response);
 }
 
 namespace detail {
 
-template <typename T>
-inline constexpr bool always_false = false;
+template <typename T> inline constexpr bool always_false = false;
 
-template <typename T>
-struct IsStorageResponse : std::false_type {};
+template <typename T> struct IsStorageResponse : std::false_type {};
+template <ResponseType Type> struct IsStorageResponse<StorageResponseT<Type>> : std::true_type {};
 
-template <ResponseType Type>
-struct IsStorageResponse<StorageResponseT<Type>> : std::true_type {};
+template <typename T> struct IsSingleRetrievalResponse : std::false_type {};
+template <ResponseType Type, typename Item> struct IsSingleRetrievalResponse<SingleRetrievalResponseT<Type, Item>> : std::true_type {};
 
-template <typename T>
-struct IsSingleRetrievalResponse : std::false_type {};
+template <typename T> struct IsMultiRetrievalResponse : std::false_type {};
+template <ResponseType Type, typename Item> struct IsMultiRetrievalResponse<MultiRetrievalResponseT<Type, Item>> : std::true_type {};
 
-template <ResponseType Type, typename Item>
-struct IsSingleRetrievalResponse<SingleRetrievalResponseT<Type, Item>> : std::true_type {};
-
-template <typename T>
-struct IsMultiRetrievalResponse : std::false_type {};
-
-template <ResponseType Type, typename Item>
-struct IsMultiRetrievalResponse<MultiRetrievalResponseT<Type, Item>> : std::true_type {};
-
-template <typename T>
-struct IsArithmeticResponse : std::false_type {};
-
-template <ResponseType Type>
-struct IsArithmeticResponse<ArithmeticResponseT<Type>> : std::true_type {};
+template <typename T> struct IsArithmeticResponse : std::false_type {};
+template <ResponseType Type> struct IsArithmeticResponse<ArithmeticResponseT<Type>> : std::true_type {};
 
 inline void validate_key(std::string_view key) {
-	if (key.empty() || key.size() > 250) {
-		throw std::invalid_argument("invalid response key length");
-	}
-	for (unsigned char ch : key) {
-		if (ch <= 0x20 || ch == 0x7f) {
-			throw std::invalid_argument("invalid response key characters");
-		}
-	}
+    if (key.empty() || key.size() > 250) {
+        throw std::invalid_argument("invalid response key length");
+    }
+    for (unsigned char ch : key) {
+        if (ch <= 0x20 || ch == 0x7f) {
+            throw std::invalid_argument("invalid response key characters");
+        }
+    }
 }
 
 inline void validate_line(std::string_view text) {
-	for (unsigned char ch : text) {
-		if (ch == '\r' || ch == '\n' || ch == 0) {
-			throw std::invalid_argument("response line contains CR/LF/NUL");
-		}
-	}
+    for (unsigned char ch : text) {
+        if (ch == '\r' || ch == '\n' || ch == 0) {
+            throw std::invalid_argument("response line contains CR/LF/NUL");
+        }
+    }
 }
 
 inline void validate_token(std::string_view token) {
-	if (token.empty()) {
-		throw std::invalid_argument("empty response token");
-	}
-	for (unsigned char ch : token) {
-		if (ch <= 0x20 || ch == 0x7f) {
-			throw std::invalid_argument("invalid response token");
-		}
-	}
+    if (token.empty()) {
+        throw std::invalid_argument("empty response token");
+    }
+    for (unsigned char ch : token) {
+        if (ch <= 0x20 || ch == 0x7f) {
+            throw std::invalid_argument("invalid response token");
+        }
+    }
 }
 
 // 仅用于发送前检查，确保较后条目的非法字段不会导致先发出半个协议响应。
 struct ValidationSink {
-	static constexpr bool validation_only = true;
-	void append(std::string_view) const noexcept {
-	}
-
-	template <typename UInt>
-	void append_uint(UInt) const noexcept {
-	}
+    static constexpr bool validation_only = true;
+    void append(std::string_view) const noexcept {}
+    template <typename UInt> void append_uint(UInt) const noexcept {}
 };
 
 // 兼容原有 encode_batch；只有显式调用编码接口时才生成完整字节串。
 struct StringSink {
-	static constexpr bool validation_only = false;
-	std::string &bytes;
+    static constexpr bool validation_only = false;
+    std::string &bytes;
 
-	void append(std::string_view text) {
-		if (!text.empty()) {
-			bytes.append(text.data(), text.size());
-		}
-	}
+    void append(std::string_view text) {
+        if (!text.empty()) {
+            bytes.append(text.data(), text.size());
+        }
+    }
 
-	template <typename UInt>
-	void append_uint(UInt number) {
-		std::array<char, std::numeric_limits<UInt>::digits10 + 1> buffer;
-		const auto [last, error] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), number);
-		if (error != std::errc {}) {
-			throw std::logic_error("failed to encode unsigned integer");
-		}
-		append(std::string_view(buffer.data(), static_cast<std::size_t>(last - buffer.data())));
-	}
+    template <typename UInt> void append_uint(UInt number) {
+        std::array<char, std::numeric_limits<UInt>::digits10 + 1> buffer;
+        const auto [last, error] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), number);
+        if (error != std::errc{}) {
+            throw std::logic_error("failed to encode unsigned integer");
+        }
+        append(std::string_view(buffer.data(), static_cast<std::size_t>(last - buffer.data())));
+    }
 };
 
-// 固定容量的分散聚集发送器。只保存指针和长度，绝不拼接完整响应或复制 value。
+// 固定容量的异步分散聚集发送器。只保存指针和长度，不拼接完整响应或复制 value。
+// 本对象位于发送协程帧内，其描述符和数字区在异步写完成前始终有效。
 class SocketSink {
-public:
-	static constexpr bool validation_only = false;
+  public:
+    static constexpr bool validation_only = false;
 
-	explicit SocketSink(boost::asio::ip::tcp::socket &socket) : socket_(socket) {
-	}
+    explicit SocketSink(boost::asio::ip::tcp::socket &socket) : socket_(socket) {}
+    SocketSink(const SocketSink &) = delete;
+    SocketSink &operator=(const SocketSink &) = delete;
 
-	SocketSink(const SocketSink &) = delete;
-	SocketSink &operator=(const SocketSink &) = delete;
+    boost::asio::awaitable<void> append(std::string_view text) {
+        if (text.empty()) {
+            co_return;
+        }
+        if (buffer_count_ == buffers_.size()) {
+            co_await flush();
+        }
+        buffers_[buffer_count_++] = boost::asio::const_buffer(text.data(), text.size());
+    }
 
-	void append(std::string_view text) {
-		if (text.empty()) {
-			return;
-		}
-		if (buffer_count_ == buffers_.size()) {
-			flush();
-		}
-		buffers_[buffer_count_++] = boost::asio::const_buffer(text.data(), text.size());
-	}
+    template <typename UInt> boost::asio::awaitable<void> append_uint(UInt number) {
+        static_assert(std::is_unsigned_v<UInt> && !std::is_same_v<UInt, bool>);
+        constexpr std::size_t capacity = std::numeric_limits<UInt>::digits10 + 1;
+        static_assert(capacity <= kNumberBytes);
 
-	template <typename UInt>
-	void append_uint(UInt number) {
-		static_assert(std::is_unsigned_v<UInt> && !std::is_same_v<UInt, bool>);
-		constexpr std::size_t capacity = std::numeric_limits<UInt>::digits10 + 1;
-		static_assert(capacity <= kNumberBytes);
+        // 编码前先等待腾出空间；flush 完成前不覆盖任何待发送的数字。
+        if (buffer_count_ == buffers_.size() || numbers_.size() - number_count_ < capacity) {
+            co_await flush();
+        }
 
-		// 在编码之前保证描述符和数字区都有空间，防止编码后 flush 使数字指针失效。
-		if (buffer_count_ == buffers_.size() || numbers_.size() - number_count_ < capacity) {
-			flush();
-		}
+        char *first = numbers_.data() + number_count_;
+        const auto [last, error] = std::to_chars(first, first + capacity, number);
+        if (error != std::errc{}) {
+            throw std::logic_error("failed to encode unsigned integer");
+        }
 
-		char *first = numbers_.data() + number_count_;
-		const auto [last, error] = std::to_chars(first, first + capacity, number);
-		if (error != std::errc {}) {
-			throw std::logic_error("failed to encode unsigned integer");
-		}
+        const std::size_t size = static_cast<std::size_t>(last - first);
+        number_count_ += size;
+        buffers_[buffer_count_++] = boost::asio::const_buffer(first, size);
+    }
 
-		const std::size_t size = static_cast<std::size_t>(last - first);
-		number_count_ += size;
-		buffers_[buffer_count_++] = boost::asio::const_buffer(first, size);
-	}
+    boost::asio::awaitable<void> flush() {
+        if (buffer_count_ == 0) {
+            co_return;
+        }
 
-	void flush() {
-		if (buffer_count_ == 0) {
-			return;
-		}
+        // async_write 处理短写；co_await 完成后才允许复用描述符和数字区。
+        const std::size_t written = co_await boost::asio::async_write(
+            socket_, std::span<const boost::asio::const_buffer>(buffers_.data(), buffer_count_), boost::asio::use_awaitable);
+        bytes_sent_ += written;
+        buffer_count_ = 0;
+        number_count_ = 0;
+    }
 
-		// boost::asio::write 负责处理短写；只有整组缓冲区写完后，才能复用数字区。
-		bytes_sent_ +=
-		    boost::asio::write(socket_, std::span<const boost::asio::const_buffer>(buffers_.data(), buffer_count_));
-		buffer_count_ = 0;
-		number_count_ = 0;
-	}
+    std::size_t bytes_sent() const noexcept {
+        return bytes_sent_;
+    }
 
-	std::size_t bytes_sent() const noexcept {
-		return bytes_sent_;
-	}
+  private:
+    static constexpr std::size_t kBufferCount = 64;
+    static constexpr std::size_t kNumberBytes = 1024;
 
-private:
-	static constexpr std::size_t kBufferCount = 64;
-	static constexpr std::size_t kNumberBytes = 1024;
-
-	boost::asio::ip::tcp::socket &socket_;
-	std::array<boost::asio::const_buffer, kBufferCount> buffers_;
-	std::array<char, kNumberBytes> numbers_;
-	std::size_t buffer_count_ = 0;
-	std::size_t number_count_ = 0;
-	std::size_t bytes_sent_ = 0;
+    boost::asio::ip::tcp::socket &socket_;
+    std::array<boost::asio::const_buffer, kBufferCount> buffers_;
+    std::array<char, kNumberBytes> numbers_;
+    std::size_t buffer_count_ = 0;
+    std::size_t number_count_ = 0;
+    std::size_t bytes_sent_ = 0;
 };
 
 inline std::string_view storage_text(StorageStatus status) {
-	switch (status) {
-	case StorageStatus::Stored:
-		return "STORED\r\n";
-	case StorageStatus::NotStored:
-		return "NOT_STORED\r\n";
-	case StorageStatus::NoReply:
-		return {};
-	default:
-		throw std::invalid_argument("invalid storage response status");
-	}
+    switch (status) {
+    case StorageStatus::Stored:
+        return "STORED\r\n";
+    case StorageStatus::NotStored:
+        return "NOT_STORED\r\n";
+    case StorageStatus::NoReply:
+        return {};
+    default:
+        throw std::invalid_argument("invalid storage response status");
+    }
 }
 
 inline std::string_view cas_text(CasStatus status) {
-	switch (status) {
-	case CasStatus::Stored:
-		return "STORED\r\n";
-	case CasStatus::Exists:
-		return "EXISTS\r\n";
-	case CasStatus::NotFound:
-		return "NOT_FOUND\r\n";
-	case CasStatus::NoReply:
-		return {};
-	default:
-		throw std::invalid_argument("invalid cas response status");
-	}
+    switch (status) {
+    case CasStatus::Stored:
+        return "STORED\r\n";
+    case CasStatus::Exists:
+        return "EXISTS\r\n";
+    case CasStatus::NotFound:
+        return "NOT_FOUND\r\n";
+    case CasStatus::NoReply:
+        return {};
+    default:
+        throw std::invalid_argument("invalid cas response status");
+    }
 }
 
 inline std::string_view delete_text(DeleteStatus status) {
-	switch (status) {
-	case DeleteStatus::Deleted:
-		return "DELETED\r\n";
-	case DeleteStatus::NotFound:
-		return "NOT_FOUND\r\n";
-	case DeleteStatus::NoReply:
-		return {};
-	default:
-		throw std::invalid_argument("invalid delete response status");
-	}
+    switch (status) {
+    case DeleteStatus::Deleted:
+        return "DELETED\r\n";
+    case DeleteStatus::NotFound:
+        return "NOT_FOUND\r\n";
+    case DeleteStatus::NoReply:
+        return {};
+    default:
+        throw std::invalid_argument("invalid delete response status");
+    }
 }
 
 inline std::string_view touch_text(TouchStatus status) {
-	switch (status) {
-	case TouchStatus::Touched:
-		return "TOUCHED\r\n";
-	case TouchStatus::NotFound:
-		return "NOT_FOUND\r\n";
-	case TouchStatus::NoReply:
-		return {};
-	default:
-		throw std::invalid_argument("invalid touch response status");
-	}
+    switch (status) {
+    case TouchStatus::Touched:
+        return "TOUCHED\r\n";
+    case TouchStatus::NotFound:
+        return "NOT_FOUND\r\n";
+    case TouchStatus::NoReply:
+        return {};
+    default:
+        throw std::invalid_argument("invalid touch response status");
+    }
 }
 
 inline std::string_view ok_text(OkStatus status) {
-	switch (status) {
-	case OkStatus::Ok:
-		return "OK\r\n";
-	case OkStatus::NoReply:
-		return {};
-	default:
-		throw std::invalid_argument("invalid OK response status");
-	}
+    switch (status) {
+    case OkStatus::Ok:
+        return "OK\r\n";
+    case OkStatus::NoReply:
+        return {};
+    default:
+        throw std::invalid_argument("invalid OK response status");
+    }
 }
 
 inline std::string_view stats_prefix(StatsLineType type) {
-	switch (type) {
-	case StatsLineType::Stat:
-		return "STAT ";
-	case StatsLineType::Item:
-		return "ITEM ";
-	case StatsLineType::Prefix:
-		return "PREFIX ";
-	default:
-		throw std::invalid_argument("invalid stats line type");
-	}
+    switch (type) {
+    case StatsLineType::Stat:
+        return "STAT ";
+    case StatsLineType::Item:
+        return "ITEM ";
+    case StatsLineType::Prefix:
+        return "PREFIX ";
+    default:
+        throw std::invalid_argument("invalid stats line type");
+    }
 }
 
 inline std::string_view stats_end(StatsTerminator terminator) {
-	switch (terminator) {
-	case StatsTerminator::End:
-		return "END\r\n";
-	case StatsTerminator::Reset:
-		return "RESET\r\n";
-	case StatsTerminator::Ok:
-		return "OK\r\n";
-	default:
-		throw std::invalid_argument("invalid stats terminator");
-	}
+    switch (terminator) {
+    case StatsTerminator::End:
+        return "END\r\n";
+    case StatsTerminator::Reset:
+        return "RESET\r\n";
+    case StatsTerminator::Ok:
+        return "OK\r\n";
+    default:
+        throw std::invalid_argument("invalid stats terminator");
+    }
 }
 
-template <typename Sink, typename Item>
-void emit_retrieval_item(Sink &out, const Item &item) {
-	validate_key(item.key);
-	out.append("VALUE ");
-	out.append(item.key);
-	out.append(" ");
-	out.append_uint(item.flags);
-	out.append(" ");
-	out.append_uint(item.value.size());
-	if constexpr (std::is_same_v<Item, CasValueItem>) {
-		out.append(" ");
-		out.append_uint(item.cas_unique);
-	}
-	out.append("\r\n");
-	out.append(item.value);
-	out.append("\r\n");
+// 以下同步编码函数只服务于发送前校验和 encode_batch，不执行 socket I/O。
+template <typename Sink, typename Item> void emit_retrieval_item(Sink &out, const Item &item) {
+    validate_key(item.key);
+    out.append("VALUE ");
+    out.append(item.key);
+    out.append(" ");
+    out.append_uint(item.flags);
+    out.append(" ");
+    out.append_uint(item.value.size());
+    if constexpr (std::is_same_v<Item, CasValueItem>) {
+        out.append(" ");
+        out.append_uint(item.cas_unique);
+    }
+    out.append("\r\n");
+    out.append(item.value);
+    out.append("\r\n");
 }
 
-template <typename Sink>
-void emit_stats(Sink &out, const StatsResponse &response) {
-	const std::string_view terminator = stats_end(response.terminator);
-	if (response.terminator != StatsTerminator::End && !response.lines.empty()) {
-		throw std::invalid_argument("stats RESET/OK must not have data lines");
-	}
-	for (const StatsLine &line : response.lines) {
-		validate_token(line.key);
-		validate_line(line.value);
-		out.append(stats_prefix(line.type));
-		out.append(line.key);
-		if (!line.value.empty()) {
-			out.append(" ");
-			out.append(line.value);
-		}
-		out.append("\r\n");
-	}
-	out.append(terminator);
+template <typename Sink> void emit_stats(Sink &out, const StatsResponse &response) {
+    const std::string_view terminator = stats_end(response.terminator);
+    if (response.terminator != StatsTerminator::End && !response.lines.empty()) {
+        throw std::invalid_argument("stats RESET/OK must not have data lines");
+    }
+    for (const StatsLine &line : response.lines) {
+        validate_token(line.key);
+        validate_line(line.value);
+        out.append(stats_prefix(line.type));
+        out.append(line.key);
+        if (!line.value.empty()) {
+            out.append(" ");
+            out.append(line.value);
+        }
+        out.append("\r\n");
+    }
+    out.append(terminator);
 }
 
-// 普通文本直接引用原字符串；仅将 CR/LF/NUL 对应位置改为静态空格，不创建清洗后的字符串。
-template <typename Sink>
-void emit_error_message(Sink &out, std::string_view message) {
-	if constexpr (Sink::validation_only) {
-		return;
-	}
+// 普通文本直接引用原字符串；CR/LF/NUL 替换为静态空格，不创建清洗后的字符串。
+template <typename Sink> void emit_error_message(Sink &out, std::string_view message) {
+    if constexpr (Sink::validation_only) {
+        return;
+    }
+    if (message.empty()) {
+        out.append("unspecified error");
+        return;
+    }
 
-	if (message.empty()) {
-		out.append("unspecified error");
-		return;
-	}
-
-	constexpr std::string_view spaces = "                                                                ";
-	const auto is_control = [](unsigned char ch) {
-		return ch == '\r' || ch == '\n' || ch == 0;
-	};
-	std::size_t start = 0;
-
-	while (start < message.size()) {
-		std::size_t last = start;
-		while (last < message.size() && !is_control(static_cast<unsigned char>(message[last]))) {
-			++last;
-		}
-		out.append(message.substr(start, last - start));
-		start = last;
-		while (last < message.size() && is_control(static_cast<unsigned char>(message[last]))) {
-			++last;
-		}
-		while (start < last) {
-			const std::size_t count = last - start < spaces.size() ? last - start : spaces.size();
-			out.append(spaces.substr(0, count));
-			start += count;
-		}
-	}
+    constexpr std::string_view spaces = "                                                                ";
+    const auto is_control = [](unsigned char ch) { return ch == '\r' || ch == '\n' || ch == 0; };
+    std::size_t start = 0;
+    while (start < message.size()) {
+        std::size_t last = start;
+        while (last < message.size() && !is_control(static_cast<unsigned char>(message[last]))) {
+            ++last;
+        }
+        out.append(message.substr(start, last - start));
+        start = last;
+        while (last < message.size() && is_control(static_cast<unsigned char>(message[last]))) {
+            ++last;
+        }
+        while (start < last) {
+            const std::size_t count = last - start < spaces.size() ? last - start : spaces.size();
+            out.append(spaces.substr(0, count));
+            start += count;
+        }
+    }
 }
 
-template <typename Sink>
-void emit_error(Sink &out, const ErrorResponse &error) {
-	switch (error.kind) {
-	case ResponseErrorKind::Error:
-		out.append("ERROR\r\n");
-		return;
-	case ResponseErrorKind::ClientError:
-		out.append("CLIENT_ERROR ");
-		break;
-	case ResponseErrorKind::ServerError:
-		out.append("SERVER_ERROR ");
-		break;
-	default:
-		throw std::invalid_argument("invalid response error kind");
-	}
-	emit_error_message(out, error.message);
-	out.append("\r\n");
+template <typename Sink> void emit_error(Sink &out, const ErrorResponse &error) {
+    switch (error.kind) {
+    case ResponseErrorKind::Error:
+        out.append("ERROR\r\n");
+        return;
+    case ResponseErrorKind::ClientError:
+        out.append("CLIENT_ERROR ");
+        break;
+    case ResponseErrorKind::ServerError:
+        out.append("SERVER_ERROR ");
+        break;
+    default:
+        throw std::invalid_argument("invalid response error kind");
+    }
+    emit_error_message(out, error.message);
+    out.append("\r\n");
 }
 
-template <typename Sink, typename T>
-bool emit_concrete(Sink &out, const T &value) {
-	if constexpr (IsStorageResponse<T>::value) {
-		out.append(storage_text(value.status));
-	} else if constexpr (std::is_same_v<T, CasResponse>) {
-		out.append(cas_text(value.status));
-	} else if constexpr (IsSingleRetrievalResponse<T>::value) {
-		if (value.item) {
-			emit_retrieval_item(out, *value.item);
-		}
-		out.append("END\r\n");
-	} else if constexpr (IsMultiRetrievalResponse<T>::value) {
-		for (const auto &item : value.items) {
-			emit_retrieval_item(out, item);
-		}
-		out.append("END\r\n");
-	} else if constexpr (std::is_same_v<T, DeleteResponse>) {
-		out.append(delete_text(value.status));
-	} else if constexpr (std::is_same_v<T, TouchResponse>) {
-		out.append(touch_text(value.status));
-	} else if constexpr (IsArithmeticResponse<T>::value) {
-		switch (value.status) {
-		case ArithmeticStatus::NoReply:
-			return false;
-		case ArithmeticStatus::Reply:
-			break;
-		default:
-			throw std::invalid_argument("invalid arithmetic response status");
-		}
-		if (value.value) {
-			out.append_uint(*value.value);
-			out.append("\r\n");
-		} else {
-			out.append("NOT_FOUND\r\n");
-		}
-	} else if constexpr (std::is_same_v<T, FlushAllResponse> || std::is_same_v<T, VerbosityResponse>) {
-		out.append(ok_text(value.status));
-	} else if constexpr (std::is_same_v<T, StatsResponse>) {
-		emit_stats(out, value);
-	} else if constexpr (std::is_same_v<T, VersionResponse>) {
-		validate_token(value.version);
-		out.append("VERSION ");
-		out.append(value.version);
-		out.append("\r\n");
-	} else if constexpr (std::is_same_v<T, QuitResponse>) {
-		return true;
-	} else if constexpr (std::is_same_v<T, ErrorResponse>) {
-		if (!value.noreply) {
-			emit_error(out, value);
-		}
-		return value.close_connection;
-	} else if constexpr (std::is_same_v<T, NoReplyResponse>) {
-		// noreply：执行完成，但不向客户端输出任何字节。
-	} else {
-		static_assert(always_false<T>, "missing response encoder case");
-	}
-	return false;
+template <typename Sink, typename T> bool emit_concrete(Sink &out, const T &value) {
+    if constexpr (IsStorageResponse<T>::value) {
+        out.append(storage_text(value.status));
+    } else if constexpr (std::is_same_v<T, CasResponse>) {
+        out.append(cas_text(value.status));
+    } else if constexpr (IsSingleRetrievalResponse<T>::value) {
+        if (value.item) {
+            emit_retrieval_item(out, *value.item);
+        }
+        out.append("END\r\n");
+    } else if constexpr (IsMultiRetrievalResponse<T>::value) {
+        for (const auto &item : value.items) {
+            emit_retrieval_item(out, item);
+        }
+        out.append("END\r\n");
+    } else if constexpr (std::is_same_v<T, DeleteResponse>) {
+        out.append(delete_text(value.status));
+    } else if constexpr (std::is_same_v<T, TouchResponse>) {
+        out.append(touch_text(value.status));
+    } else if constexpr (IsArithmeticResponse<T>::value) {
+        switch (value.status) {
+        case ArithmeticStatus::NoReply:
+            return false;
+        case ArithmeticStatus::Reply:
+            break;
+        default:
+            throw std::invalid_argument("invalid arithmetic response status");
+        }
+        if (value.value) {
+            out.append_uint(*value.value);
+            out.append("\r\n");
+        } else {
+            out.append("NOT_FOUND\r\n");
+        }
+    } else if constexpr (std::is_same_v<T, FlushAllResponse> || std::is_same_v<T, VerbosityResponse>) {
+        out.append(ok_text(value.status));
+    } else if constexpr (std::is_same_v<T, StatsResponse>) {
+        emit_stats(out, value);
+    } else if constexpr (std::is_same_v<T, VersionResponse>) {
+        validate_token(value.version);
+        out.append("VERSION ");
+        out.append(value.version);
+        out.append("\r\n");
+    } else if constexpr (std::is_same_v<T, QuitResponse>) {
+        return true;
+    } else if constexpr (std::is_same_v<T, ErrorResponse>) {
+        if (!value.noreply) {
+            emit_error(out, value);
+        }
+        return value.close_connection;
+    } else if constexpr (std::is_same_v<T, NoReplyResponse>) {
+        // noreply：执行完成，但不向客户端输出任何字节。
+    } else {
+        static_assert(always_false<T>, "missing response encoder case");
+    }
+    return false;
 }
 
-template <typename Sink, typename Variant>
-bool emit_group(Sink &out, const Variant &group) {
-	return std::visit([&out](const auto &value) { return emit_concrete(out, value); }, group);
+template <typename Sink, typename Variant> bool emit_group(Sink &out, const Variant &group) {
+    return std::visit([&out](const auto &value) { return emit_concrete(out, value); }, group);
 }
 
-template <typename Sink>
-bool emit_one(Sink &out, const Response &response) {
-	return std::visit(
-	    [&out](const auto &value) -> bool {
-		    using T = std::remove_cvref_t<decltype(value)>;
-		    if constexpr (std::is_same_v<T, ErrorResponse>) {
-			    return emit_concrete(out, value);
-		    } else {
-			    return emit_group(out, value.variant());
-		    }
-	    },
-	    response);
+template <typename Sink> bool emit_one(Sink &out, const Response &response) {
+    return std::visit(
+        [&out](const auto &value) -> bool {
+            using T = std::remove_cvref_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, ErrorResponse>) {
+                return emit_concrete(out, value);
+            } else {
+                return emit_group(out, value.variant());
+            }
+        },
+        response);
 }
 
-template <typename Variant>
-SendResult send_group(boost::asio::ip::tcp::socket &socket, const Variant &group) {
-	ValidationSink validator;
-	const bool close = emit_group(validator, group);
-
-	SocketSink out(socket);
-	emit_group(out, group);
-	out.flush();
-	return SendResult {out.bytes_sent(), 1, close};
+// 异步编码路径：每次追加都等待完成，容量耗尽时可逐层挂起并异步写出。
+template <typename Item> boost::asio::awaitable<void> async_emit_retrieval_item(SocketSink &out, const Item &item) {
+    validate_key(item.key);
+    co_await out.append("VALUE ");
+    co_await out.append(item.key);
+    co_await out.append(" ");
+    co_await out.append_uint(item.flags);
+    co_await out.append(" ");
+    co_await out.append_uint(item.value.size());
+    if constexpr (std::is_same_v<Item, CasValueItem>) {
+        co_await out.append(" ");
+        co_await out.append_uint(item.cas_unique);
+    }
+    co_await out.append("\r\n");
+    co_await out.append(item.value);
+    co_await out.append("\r\n");
 }
 
-template <typename T>
-SendResult send_concrete(boost::asio::ip::tcp::socket &socket, const T &value) {
-	ValidationSink validator;
-	const bool close = emit_concrete(validator, value);
+inline boost::asio::awaitable<void> async_emit_stats(SocketSink &out, const StatsResponse &response) {
+    const std::string_view terminator = stats_end(response.terminator);
+    if (response.terminator != StatsTerminator::End && !response.lines.empty()) {
+        throw std::invalid_argument("stats RESET/OK must not have data lines");
+    }
+    for (const StatsLine &line : response.lines) {
+        validate_token(line.key);
+        validate_line(line.value);
+        co_await out.append(stats_prefix(line.type));
+        co_await out.append(line.key);
+        if (!line.value.empty()) {
+            co_await out.append(" ");
+            co_await out.append(line.value);
+        }
+        co_await out.append("\r\n");
+    }
+    co_await out.append(terminator);
+}
 
-	SocketSink out(socket);
-	emit_concrete(out, value);
-	out.flush();
-	return SendResult {out.bytes_sent(), 1, close};
+// 普通文本直接引用原字符串；CR/LF/NUL 替换为静态空格，不创建清洗后的字符串。
+inline boost::asio::awaitable<void> async_emit_error_message(SocketSink &out, std::string_view message) {
+    if (message.empty()) {
+        co_await out.append("unspecified error");
+        co_return;
+    }
+
+    constexpr std::string_view spaces = "                                                                ";
+    const auto is_control = [](unsigned char ch) { return ch == '\r' || ch == '\n' || ch == 0; };
+    std::size_t start = 0;
+    while (start < message.size()) {
+        std::size_t last = start;
+        while (last < message.size() && !is_control(static_cast<unsigned char>(message[last]))) {
+            ++last;
+        }
+        co_await out.append(message.substr(start, last - start));
+        start = last;
+        while (last < message.size() && is_control(static_cast<unsigned char>(message[last]))) {
+            ++last;
+        }
+        while (start < last) {
+            const std::size_t count = last - start < spaces.size() ? last - start : spaces.size();
+            co_await out.append(spaces.substr(0, count));
+            start += count;
+        }
+    }
+}
+
+inline boost::asio::awaitable<void> async_emit_error(SocketSink &out, const ErrorResponse &error) {
+    switch (error.kind) {
+    case ResponseErrorKind::Error:
+        co_await out.append("ERROR\r\n");
+        co_return;
+    case ResponseErrorKind::ClientError:
+        co_await out.append("CLIENT_ERROR ");
+        break;
+    case ResponseErrorKind::ServerError:
+        co_await out.append("SERVER_ERROR ");
+        break;
+    default:
+        throw std::invalid_argument("invalid response error kind");
+    }
+    co_await async_emit_error_message(out, error.message);
+    co_await out.append("\r\n");
+}
+
+template <typename T> boost::asio::awaitable<bool> async_emit_concrete(SocketSink &out, const T &value) {
+    if constexpr (IsStorageResponse<T>::value) {
+        co_await out.append(storage_text(value.status));
+    } else if constexpr (std::is_same_v<T, CasResponse>) {
+        co_await out.append(cas_text(value.status));
+    } else if constexpr (IsSingleRetrievalResponse<T>::value) {
+        if (value.item) {
+            co_await async_emit_retrieval_item(out, *value.item);
+        }
+        co_await out.append("END\r\n");
+    } else if constexpr (IsMultiRetrievalResponse<T>::value) {
+        for (const auto &item : value.items) {
+            co_await async_emit_retrieval_item(out, item);
+        }
+        co_await out.append("END\r\n");
+    } else if constexpr (std::is_same_v<T, DeleteResponse>) {
+        co_await out.append(delete_text(value.status));
+    } else if constexpr (std::is_same_v<T, TouchResponse>) {
+        co_await out.append(touch_text(value.status));
+    } else if constexpr (IsArithmeticResponse<T>::value) {
+        switch (value.status) {
+        case ArithmeticStatus::NoReply:
+            co_return false;
+        case ArithmeticStatus::Reply:
+            break;
+        default:
+            throw std::invalid_argument("invalid arithmetic response status");
+        }
+        if (value.value) {
+            co_await out.append_uint(*value.value);
+            co_await out.append("\r\n");
+        } else {
+            co_await out.append("NOT_FOUND\r\n");
+        }
+    } else if constexpr (std::is_same_v<T, FlushAllResponse> || std::is_same_v<T, VerbosityResponse>) {
+        co_await out.append(ok_text(value.status));
+    } else if constexpr (std::is_same_v<T, StatsResponse>) {
+        co_await async_emit_stats(out, value);
+    } else if constexpr (std::is_same_v<T, VersionResponse>) {
+        validate_token(value.version);
+        co_await out.append("VERSION ");
+        co_await out.append(value.version);
+        co_await out.append("\r\n");
+    } else if constexpr (std::is_same_v<T, QuitResponse>) {
+        co_return true;
+    } else if constexpr (std::is_same_v<T, ErrorResponse>) {
+        if (!value.noreply) {
+            co_await async_emit_error(out, value);
+        }
+        co_return value.close_connection;
+    } else if constexpr (std::is_same_v<T, NoReplyResponse>) {
+        // noreply：执行完成，但不向客户端输出任何字节。
+    } else {
+        static_assert(always_false<T>, "missing response encoder case");
+    }
+    co_return false;
+}
+
+// visitor 只返回命名协程的 awaitable，自身不使用 co_await，避免捕获对象悬空。
+template <typename Variant> boost::asio::awaitable<bool> async_emit_group(SocketSink &out, const Variant &group) {
+    return std::visit([&out](const auto &value) { return async_emit_concrete(out, value); }, group);
+}
+
+inline boost::asio::awaitable<bool> async_emit_one(SocketSink &out, const Response &response) {
+    return std::visit(
+        [&out](const auto &value) -> boost::asio::awaitable<bool> {
+            using T = std::remove_cvref_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, ErrorResponse>) {
+                return async_emit_concrete(out, value);
+            } else {
+                return async_emit_group(out, value.variant());
+            }
+        },
+        response);
+}
+
+template <typename Variant> boost::asio::awaitable<SendResult> send_group(boost::asio::ip::tcp::socket &socket, const Variant &group) {
+    ValidationSink validator;
+    const bool close = emit_group(validator, group);
+
+    SocketSink out(socket);
+    co_await async_emit_group(out, group);
+    co_await out.flush();
+    co_return SendResult{out.bytes_sent(), 1, close};
+}
+
+template <typename T> boost::asio::awaitable<SendResult> send_concrete(boost::asio::ip::tcp::socket &socket, const T &value) {
+    ValidationSink validator;
+    const bool close = emit_concrete(validator, value);
+
+    SocketSink out(socket);
+    co_await async_emit_concrete(out, value);
+    co_await out.flush();
+    co_return SendResult{out.bytes_sent(), 1, close};
 }
 
 } // namespace detail
 
-[[nodiscard]] inline SendResult ErrorResponse::send_to(boost::asio::ip::tcp::socket &socket) const {
-	return detail::send_concrete(socket, *this);
+[[nodiscard]] inline boost::asio::awaitable<SendResult> ErrorResponse::send_to(boost::asio::ip::tcp::socket &socket) const {
+    return detail::send_concrete(socket, *this);
 }
 
-// 外层 Response 的统一发送入口；三种正常响应分类和 ErrorResponse 都有 send_to(socket) 成员方法。
-[[nodiscard]] inline SendResult send_to(const Response &response, boost::asio::ip::tcp::socket &socket) {
-	return std::visit([&socket](const auto &group) { return group.send_to(socket); }, response);
+// 普通转发函数：visitor 自身不是协程，不让协程引用短命 lambda 的捕获成员。
+[[nodiscard]] inline boost::asio::awaitable<SendResult> send_to(const Response &response, boost::asio::ip::tcp::socket &socket) {
+    return std::visit([&socket](const auto &group) { return group.send_to(socket); }, response);
 }
 
 struct EncodedResponseBatch {
-	std::string bytes;
-	// 已处理的响应对象数，包含 NoReply 和 Quit。
-	std::size_t responses_encoded = 0;
-	bool close_connection = false;
+    std::string bytes;
+    // 已处理的响应对象数，包含 NoReply 和 Quit。
+    std::size_t responses_encoded = 0;
+    bool close_connection = false;
 };
 
 class MemcachedResponseEncoder {
-public:
-	// 保留旧接口：只有调用此函数时才会分配完整响应字节串。
-	static EncodedResponseBatch encode_batch(std::span<const Response> responses) {
-		EncodedResponseBatch result;
-		detail::StringSink out {result.bytes};
+  public:
+    // 保留旧的同步内存编码接口，不执行 socket I/O。
+    static EncodedResponseBatch encode_batch(std::span<const Response> responses) {
+        EncodedResponseBatch result;
+        detail::StringSink out{result.bytes};
+        for (const Response &response : responses) {
+            result.close_connection = detail::emit_one(out, response);
+            ++result.responses_encoded;
+            if (result.close_connection) {
+                break;
+            }
+        }
+        return result;
+    }
 
-		for (const Response &response : responses) {
-			result.close_connection = detail::emit_one(out, response);
-			++result.responses_encoded;
-			if (result.close_connection) {
-				break;
-			}
-		}
-		return result;
-	}
+    // 跨响应共用固定发送区，按顺序异步发送，遇到 Quit/close_connection 后停止。
+    // responses 指向的容器和响应内容必须存活且保持不变，直到 co_await 完成。
+    [[nodiscard]] static boost::asio::awaitable<SendResult> send_batch(boost::asio::ip::tcp::socket &socket, std::span<const Response> responses) {
+        SendResult result;
+        detail::ValidationSink validator;
 
-	// 可选批量入口：跨响应共用固定发送区，按顺序发送，遇到 Quit/close_connection 后停止。
-	[[nodiscard]] static SendResult send_batch(boost::asio::ip::tcp::socket &socket,
-	                                           std::span<const Response> responses) {
-		SendResult result;
-		detail::ValidationSink validator;
+        // 先检查本次实际会发送的全部响应；close 之后的响应不参与检查和发送。
+        for (const Response &response : responses) {
+            result.close_connection = detail::emit_one(validator, response);
+            ++result.responses_sent;
+            if (result.close_connection) {
+                break;
+            }
+        }
 
-		// 先检查本次实际会发送的全部响应；close 之后的响应不参与检查和发送。
-		for (const Response &response : responses) {
-			result.close_connection = detail::emit_one(validator, response);
-			++result.responses_sent;
-			if (result.close_connection) {
-				break;
-			}
-		}
-
-		detail::SocketSink out(socket);
-		for (std::size_t index = 0; index < result.responses_sent; ++index) {
-			detail::emit_one(out, responses[index]);
-		}
-		out.flush();
-		result.bytes_sent = out.bytes_sent();
-		return result;
-	}
+        detail::SocketSink out(socket);
+        for (std::size_t index = 0; index < result.responses_sent; ++index) {
+            co_await detail::async_emit_one(out, responses[index]);
+        }
+        co_await out.flush();
+        result.bytes_sent = out.bytes_sent();
+        co_return result;
+    }
 };
 
 } // namespace fastest

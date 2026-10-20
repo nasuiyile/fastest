@@ -67,7 +67,7 @@ private:
 				    if constexpr (std::is_same_v<T, SingleKeyCommand>) {
 					    worker_.send_single_command(std::move(arg), tcp_id);
 				    } else if constexpr (std::is_same_v<T, MultiKeyCommand>) {
-					    worker_.send_multi_command(arg, tcp_id);
+				    	worker_.send_multi_command(std::move(arg), tcp_id);
 				    } else if constexpr (std::is_same_v<T, NoKeyCommand>) {
 					    // No-key commands are not routed through key shards.
 				    }
