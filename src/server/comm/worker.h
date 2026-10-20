@@ -23,22 +23,24 @@ struct TCPSession {
 	static constexpr uint32_t kPauseReadBacklog = 1024;
 	static constexpr uint32_t kResumeReadBacklog = 256;
 
+	// 注意：resume_read 的初始化依赖 socket，socket 必须声明在 resume_read 之前；
+	//      out 引用 inflight 中的数据，inflight 需声明在 out 之前（析构时 out 先于 inflight 销毁）。
+
+
 	tcp::socket socket;
+	asio::steady_timer resume_read;       // 背压：当条件变量用，永不到期，cancel() 唤醒
 	RingArray ring_array;
+	std::vector<ResponseMessage> inflight; // 写路径：在途写引用的响应，写完成前不能释放
+	GatherSink out;                        // 写路径：在途写的 buffer 描述和短字段 arena
+
 	uint32_t seq{0};
-	bool closing{false};                 // 已决定关闭：不再发送，也不再执行新命令
-	bool protocol_error_waiting{false};  // 致命解析错误已入队，等待有序响应排空后关闭
-	bool session_exited{false};          // session 协程已退出，允许 writer 回收对象
 	std::optional<uint32_t> swallow_seq; // 数据块丢弃完成前，不能发出该序号的错误
 
-	// ---- 写路径 ----
-	bool writing{false};                   // 有 async_write 在途；同一时刻最多一个，期间不能回收 session
-	std::vector<ResponseMessage> inflight; // 在途写引用的响应，写完成前不能释放
-	GatherSink out;                        // 在途写的 buffer 描述和短字段 arena
-
-	// ---- 背压 ----
-	bool read_paused{false};        // 读协程因背压在 resume_read 上等待
-	asio::steady_timer resume_read; // 当条件变量用：永不到期，cancel() 唤醒
+	bool closing{false};                // 已决定关闭：不再发送，也不再执行新命令
+	bool protocol_error_waiting{false}; // 致命解析错误已入队，等待有序响应排空后关闭
+	bool session_exited{false};         // session 协程已退出，允许 writer 回收对象
+	bool writing{false};                // 写路径：有 async_write 在途；同一时刻最多一个，期间不能回收 session
+	bool read_paused{false};            // 背压：读协程因背压在 resume_read 上等待
 
 	explicit TCPSession(tcp::socket &&s)
 		: socket(std::move(s)), resume_read(socket.get_executor(), asio::steady_timer::time_point::max()) {
@@ -217,6 +219,7 @@ public:
 		const uint32_t seq = session_it->second->seq++;
 		if (shard_comm_.is_current_shard(shard)) {
 			auto response = data_.handle_single_command(std::move(command));
+			//在当前分片 那么直接处理
 			handle_response_message(ResponseMessage{.tcp_id = tcp_id,
 			                                                 .seq = seq,
 			                                                 .shard_id = static_cast<uint16_t>(current_shard_id()),
@@ -321,6 +324,7 @@ private:
 		kick_write(tcp_id, session);
 	}
 
+	// 只有当前的线程会调用这个方法。
 	// 写路径只入队、不等待：本分片 inline 路径、mailbox、错误和 finish_swallow 都调用这里。
 	// 同一连接同一时刻最多一个 async_write 在途；在途期间新就绪的响应留在环形数组，写完成后作为下一批一起发出。
 	// 调用后 session 可能已被回收，调用方不能再访问它。

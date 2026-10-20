@@ -15,26 +15,21 @@ class FastByteHash {
 public:
 	static constexpr std::uint64_t goldenRatio = 0x9e3779b97f4a7c15ULL;
 
-	explicit constexpr FastByteHash(
-		std::uint64_t seed = goldenRatio) noexcept
-		: seed_(seed) {
+	explicit constexpr FastByteHash(std::uint64_t seed = goldenRatio) noexcept : seed_(seed) {
 	}
 
-	[[nodiscard]] std::uint64_t operator()(
-		std::span<const std::byte> key) const noexcept {
+	[[nodiscard]] std::uint64_t operator()(std::span<const std::byte> key) const noexcept {
 		const auto *p = key.data();
 		std::size_t n = key.size();
 
-		std::uint64_t h = mix(
-			seed_ ^ (static_cast<std::uint64_t>(n) * goldenRatio));
+		std::uint64_t h = mix(seed_ ^ (static_cast<std::uint64_t>(n) * goldenRatio));
 
 		while (n >= sizeof(std::uint64_t)) {
 			std::uint64_t word;
 			std::memcpy(&word, p, sizeof(word));
 
 			h ^= mix(word + 0xa0761d6478bd642fULL);
-			h = std::rotl(h, 27) * 0xe7037ed1a0b428dbULL
-			    + 0x8ebc6af09c88c6e3ULL;
+			h = std::rotl(h, 27) * 0xe7037ed1a0b428dbULL + 0x8ebc6af09c88c6e3ULL;
 
 			p += sizeof(word);
 			n -= sizeof(word);
@@ -43,8 +38,7 @@ public:
 		if (n != 0) {
 			std::uint64_t tail = 0;
 			std::memcpy(&tail, p, n);
-			h ^= mix(tail ^ (
-				         static_cast<std::uint64_t>(n) * 0x589965cc75374cc3ULL));
+			h ^= mix(tail ^ (static_cast<std::uint64_t>(n) * 0x589965cc75374cc3ULL));
 		}
 
 		return mix(h);
@@ -71,9 +65,7 @@ struct ItemKey {
 	Key key;
 
 	explicit ItemKey(Key k)
-		: hash(FastByteHash{}(std::as_bytes(
-			  std::span<const char>{k.data(), k.size()}))),
-		  key(std::move(k)) {
+	    : hash(FastByteHash {}(std::as_bytes(std::span<const char> {k.data(), k.size()}))), key(std::move(k)) {
 	}
 };
 
@@ -94,9 +86,7 @@ public:
 
 	ByteBuffer &operator=(const ByteBuffer &) = delete;
 
-	ByteBuffer(ByteBuffer &&other) noexcept
-		: data_(std::move(other.data_)),
-		  size_(std::exchange(other.size_, 0)) {
+	ByteBuffer(ByteBuffer &&other) noexcept : data_(std::move(other.data_)), size_(std::exchange(other.size_, 0)) {
 	}
 
 	ByteBuffer &operator=(ByteBuffer &&other) noexcept {
@@ -111,8 +101,7 @@ public:
 		return std::numeric_limits<size_type>::max();
 	}
 
-	[[nodiscard]] static ByteBuffer copy_of(
-		std::span<const std::byte> input) {
+	[[nodiscard]] static ByteBuffer copy_of(std::span<const std::byte> input) {
 		// 在分配和类型转换前检查，避免长度截断。
 		if (input.size() > max_size()) {
 			throw std::length_error("ByteBuffer payload exceeds uint32_t");
@@ -120,8 +109,7 @@ public:
 
 		ByteBuffer result;
 		if (!input.empty()) {
-			result.data_ =
-				std::make_unique_for_overwrite<std::byte[]>(input.size());
+			result.data_ = std::make_unique_for_overwrite<std::byte[]>(input.size());
 			result.size_ = static_cast<size_type>(input.size());
 			std::memcpy(result.data_.get(), input.data(), input.size());
 		}
@@ -160,14 +148,19 @@ private:
 using MimallocBuffer = ByteBuffer;
 
 // 常见 64 位 ABI 布局：
-// cas    : 8 字节
-// flags  : 4 字节
-// size_  : 4 字节
-// data_  : 8 字节
-// 合计 24 字节。payload 堆空间单独计算。
+// cas        : 8 字节
+// flags      : 4 字节
+// expired_at : 4 字节
+// sample_num : 4 字节
+// size_      : 4 字节
+// data_      : 8 字节
+// 合计 32 字节。payload 堆空间单独计算。
 struct CacheValue {
 	std::uint64_t cas = 0;
 	std::uint32_t flags = 0;
+	std::uint32_t expired_at = 0;
+	// 给lru和LFU预留的近似采样编号，类似redis
+	std::uint32_t sample_num = 0;
 
 	CacheValue() noexcept = default;
 
@@ -177,15 +170,19 @@ struct CacheValue {
 
 	// ByteBuffer 已经保证长度在 uint32_t 范围内。
 	explicit CacheValue(ByteBuffer &&buffer) noexcept
-		: size_(std::exchange(buffer.size_, 0)),
-		  data_(std::move(buffer.data_)) {
+	    : size_(std::exchange(buffer.size_, 0)), data_(std::move(buffer.data_)) {
+	}
+
+	// 传入全部字段；payload 所有权转移，不复制字节。
+	CacheValue(const std::uint64_t cas_value, const std::uint32_t flags_value, const std::uint32_t expired_at_value,
+	           ByteBuffer &&buffer) noexcept
+	    : cas(cas_value), flags(flags_value), expired_at(expired_at_value), size_(std::exchange(buffer.size_, 0)),
+	      data_(std::move(buffer.data_)) {
 	}
 
 	CacheValue(CacheValue &&other) noexcept
-		: cas(other.cas),
-		  flags(other.flags),
-		  size_(std::exchange(other.size_, 0)),
-		  data_(std::move(other.data_)) {
+	    : cas(other.cas), flags(other.flags), expired_at(other.expired_at), sample_num(other.sample_num),
+	      size_(std::exchange(other.size_, 0)), data_(std::move(other.data_)) {
 	}
 
 	CacheValue &operator=(CacheValue &&other) noexcept {
@@ -194,13 +191,14 @@ struct CacheValue {
 			size_ = std::exchange(other.size_, 0);
 			cas = other.cas;
 			flags = other.flags;
+			expired_at = other.expired_at;
+			sample_num = other.sample_num;
 		}
 		return *this;
 	}
 
-	[[nodiscard]] static CacheValue copy_of(
-		std::span<const std::byte> input) {
-		return CacheValue{ByteBuffer::copy_of(input)};
+	[[nodiscard]] static CacheValue copy_of(std::span<const std::byte> input) {
+		return CacheValue {ByteBuffer::copy_of(input)};
 	}
 
 	// 替换 payload，保留 cas 和 flags，不复制 payload 字节。
@@ -236,5 +234,5 @@ private:
 };
 
 // 若项目要求常见 64 位 ABI 下固定为 24 字节，可启用：
-// static_assert(sizeof(CacheValue) == 24);
+// static_assert(sizeof(CacheValue) == 32);
 } // namespace fastest
