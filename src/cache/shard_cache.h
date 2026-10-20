@@ -51,6 +51,14 @@ public:
 
 private:
 	SetResponse handle_set(SetCommand &&command) {
+		// CacheValue{
+		// 	.cas = 0,
+		// 	.flags = command.flags,
+		// 	.expires_at = command.exptime
+		//
+		// };
+		// map_.insert_or_assign()
+
 		// The parser copies the payload once. Transfer its allocation all the
 		// way into the cache, including when it crossed a shard mailbox.
 		data_.insert_or_assign(std::move(command.key),
