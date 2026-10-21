@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <sys/socket.h>
+#include "input_buffer.h"
 #include "worker.h"
 #include "type.h"
 #include "../../util/hardware_info.h"
@@ -86,29 +87,23 @@ private:
 		std::size_t shard_id = worker_.current_shard_id();
 		try {
 			const MemcachedParser parser;
-			// 保留上一次没有解析完的数据
-			std::string input;
-			std::array<char, kReadChunkBytes> recv_buffer {};
+			// 保留上一次没有解析完的数据；socket 直接读进它的尾部，不经过中转 buffer。
+			InputBuffer input;
 			// 需要丢弃的字节
 			std::size_t discard_remaining = 0;
 			while (!tcp_session.closing && !stop_->load(std::memory_order_relaxed)) {
 				if (discard_remaining != 0) {
-					const std::size_t buffered = std::min(discard_remaining, input.size());
-					input.erase(0, buffered);
-					discard_remaining -= buffered;
+					const std::size_t dropped = std::min(discard_remaining, input.size());
+					input.consume(dropped);
+					discard_remaining -= dropped;
 					if (discard_remaining == 0) {
 						worker_.finish_swallow(tcp_id);
 						continue;
 					}
-					const std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
-					const std::size_t dropped = std::min(discard_remaining, n);
-					discard_remaining -= dropped;
-					if (n > dropped) {
-						input.append(recv_buffer.data() + dropped, n - dropped);
-					}
-					if (discard_remaining == 0) {
-						worker_.finish_swallow(tcp_id);
-					}
+					// 缓冲区已空：读一块，下一轮循环再丢弃。
+					const std::span<char> buffer = input.prepare(kReadChunkBytes);
+					input.commit(co_await socket.async_read_some(asio::buffer(buffer.data(), buffer.size()),
+					                                             use_awaitable));
 					continue;
 				}
 
@@ -119,7 +114,7 @@ private:
 					continue;
 				}
 
-				auto result = parser.parse(std::span(input.data(), input.size()), 128);
+				auto result = parser.parse(input.readable(), 128);
 				// 先执行成功解析的命令，确保响应顺序正确
 				execute_batch(result.commands, tcp_id);
 				bool keep_connection = true;
@@ -127,7 +122,7 @@ private:
 					keep_connection = handle_parse_error(tcp_id, *result.error, result.discard_bytes != 0);
 				}
 				// 解析结果已投递后才能消费未解析输入
-				input.erase(0, result.consumed);
+				input.consume(result.consumed);
 				discard_remaining = result.discard_bytes;
 				if (!keep_connection) {
 					// The error response already occupies its sequence number. Stop
@@ -135,6 +130,20 @@ private:
 					// ordered response path then closes the socket after this error.
 					tcp_session.protocol_error_waiting = true;
 					break;
+				}
+				if (result.stop == StopReason::PendingValue) {
+					// 大块数据直接从 socket 读进最终的 CacheValue，不经过 input，也不撑大 input。
+					// 前面的命令已执行；之后的命令在这块数据后面才到达，顺序不变。
+					PendingValue &pending = *result.pending;
+					const std::span<std::byte> rest = pending.unfilled();
+					co_await asio::async_read(socket, asio::buffer(rest.data(), rest.size()), use_awaitable);
+					pending.filled = pending.frame.size();
+					auto completed = MemcachedParser::complete(std::move(pending));
+					execute_batch(completed.commands, tcp_id);
+					if (completed.error) {
+						handle_parse_error(tcp_id, *completed.error, false); // BadDataChunk，可恢复
+					}
+					continue;
 				}
 				if (result.stop == StopReason::Error || result.stop == StopReason::BatchLimit) {
 					// 继续解析剩余缓冲区
@@ -144,8 +153,9 @@ private:
 					break; // 写路径已关闭连接（发送失败或 Quit），不再读
 				}
 				// NeedMoreData 或 EndOfInput
-				const std::size_t n = co_await socket.async_read_some(asio::buffer(recv_buffer), use_awaitable);
-				input.append(recv_buffer.data(), n);
+				const std::span<char> buffer = input.prepare(kReadChunkBytes);
+				input.commit(
+					co_await socket.async_read_some(asio::buffer(buffer.data(), buffer.size()), use_awaitable));
 			}
 		} catch (const boost::system::system_error &e) {
 			if (e.code() != asio::error::eof && e.code() != asio::error::connection_reset &&

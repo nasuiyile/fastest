@@ -17,12 +17,11 @@ if value:
 else:
     print("键不存在或已过期")
 
-# 删除键 未适配
-# client.delete('my_key')
+client.delete('my_key')
 print("删除后获取:", client.get('my_key'))
 
 client.set('my_key2', 'Hello, suiyi!')
-value2 = client.get_many(['my_key','my_key2'])
+value2 = client.get_many(['my_key', 'my_key2'])
 if value2:
     print(f"获取到的值: {value2}")
 else:

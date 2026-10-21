@@ -52,18 +52,4 @@ struct RequestMessage {
 	uint16_t shard_id; // 发送这条请求的分片，响应会发回这里
 	RequestData data;
 };
-
-// 直接用预先算好的 hash
-struct KeyHash {
-	std::size_t operator()(const ItemKey &k) const noexcept {
-		return static_cast<std::size_t>(k.hash);
-	}
-};
-
-// 注意：相等判断不能只用 hash，还要比 key，避免 hash 冲突导致误判
-struct KeyEqual {
-	bool operator()(const ItemKey &a, const ItemKey &b) const noexcept {
-		return a.hash == b.hash && a.key == b.key;
-	}
-};
 } // namespace comm

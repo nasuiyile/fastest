@@ -2,7 +2,11 @@
 
 #include <boost/asio.hpp>
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <cstring>
+#include <memory>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "ring_array.h"
@@ -26,24 +30,23 @@ struct TCPSession {
 	// 注意：resume_read 的初始化依赖 socket，socket 必须声明在 resume_read 之前；
 	//      out 引用 inflight 中的数据，inflight 需声明在 out 之前（析构时 out 先于 inflight 销毁）。
 
-
 	tcp::socket socket;
-	asio::steady_timer resume_read;       // 背压：当条件变量用，永不到期，cancel() 唤醒
+	asio::steady_timer resume_read; // 背压：当条件变量用，永不到期，cancel() 唤醒
 	RingArray ring_array;
 	std::vector<ResponseMessage> inflight; // 写路径：在途写引用的响应，写完成前不能释放
 	GatherSink out;                        // 写路径：在途写的 buffer 描述和短字段 arena
 
-	uint32_t seq{0};
+	uint32_t seq {0};
 	std::optional<uint32_t> swallow_seq; // 数据块丢弃完成前，不能发出该序号的错误
 
-	bool closing{false};                // 已决定关闭：不再发送，也不再执行新命令
-	bool protocol_error_waiting{false}; // 致命解析错误已入队，等待有序响应排空后关闭
-	bool session_exited{false};         // session 协程已退出，允许 writer 回收对象
-	bool writing{false};                // 写路径：有 async_write 在途；同一时刻最多一个，期间不能回收 session
-	bool read_paused{false};            // 背压：读协程因背压在 resume_read 上等待
+	bool closing {false};                // 已决定关闭：不再发送，也不再执行新命令
+	bool protocol_error_waiting {false}; // 致命解析错误已入队，等待有序响应排空后关闭
+	bool session_exited {false};         // session 协程已退出，允许 writer 回收对象
+	bool writing {false};                // 写路径：有 async_write 在途；同一时刻最多一个，期间不能回收 session
+	bool read_paused {false};            // 背压：读协程因背压在 resume_read 上等待
 
 	explicit TCPSession(tcp::socket &&s)
-		: socket(std::move(s)), resume_read(socket.get_executor(), asio::steady_timer::time_point::max()) {
+	    : socket(std::move(s)), resume_read(socket.get_executor(), asio::steady_timer::time_point::max()) {
 	}
 
 	[[nodiscard]] uint32_t backlog() const noexcept {
@@ -53,7 +56,7 @@ struct TCPSession {
 	void release_inflight() noexcept {
 		inflight.clear();
 		out.clear();
-		if (inflight.capacity() > 64) {
+		if (inflight.capacity() > 256) {
 			std::vector<ResponseMessage>().swap(inflight);
 		}
 	}
@@ -61,28 +64,29 @@ struct TCPSession {
 
 inline MultiKeyCommand rebuild(const MultiKeyCommand &command, std::vector<ItemKey> keys) {
 	return std::visit(
-		[&keys](const auto &value) -> MultiKeyCommand {
-			using T = std::remove_cvref_t<decltype(value)>;
-			if constexpr (std::is_same_v<T, MultiGetCommand>) {
-				return MultiKeyCommand{MultiGetCommand{std::move(keys)}};
-			} else if constexpr (std::is_same_v<T, MultiGetsCommand>) {
-				return MultiKeyCommand{MultiGetsCommand{std::move(keys)}};
-			} else if constexpr (std::is_same_v<T, MultiGatCommand>) {
-				return MultiKeyCommand{MultiGatCommand{value.exptime, std::move(keys)}};
-			} else if constexpr (std::is_same_v<T, MultiGatsCommand>) {
-				return MultiKeyCommand{MultiGatsCommand{value.exptime, std::move(keys)}};
-			}
-		},
-		command.command);
+	    [&keys](const auto &value) -> MultiKeyCommand {
+		    using T = std::remove_cvref_t<decltype(value)>;
+		    if constexpr (std::is_same_v<T, MultiGetCommand>) {
+			    return MultiKeyCommand {MultiGetCommand {std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGetsCommand>) {
+			    return MultiKeyCommand {MultiGetsCommand {std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGatCommand>) {
+			    return MultiKeyCommand {MultiGatCommand {value.expired_at, std::move(keys)}};
+		    } else if constexpr (std::is_same_v<T, MultiGatsCommand>) {
+			    return MultiKeyCommand {MultiGatsCommand {value.expired_at, std::move(keys)}};
+		    }
+	    },
+	    command.command);
 }
 
 class Worker {
 public:
-	std::unordered_map<uint64_t, std::unique_ptr<TCPSession> > tcp_session_;
+	std::unordered_map<uint64_t, std::unique_ptr<TCPSession>> tcp_session_;
 	using Sc = ShardComm<RequestMessage, ResponseMessage>;
 
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
-		: shard_comm_(std::move(shard_comm)), multi_key_index_(shard_comm_.shard_num()), stop_(std::move(stop)) {
+	    : shard_comm_(std::move(shard_comm)), data_(static_cast<uint16_t>(shard_comm_.current_shard_id())),
+	      multi_key_index_(shard_comm_.shard_num()), stop_(std::move(stop)) {
 	}
 
 	// 接收他人请求
@@ -163,50 +167,50 @@ public:
 		return shard_comm_.current_shard_id();
 	}
 
-	void send_multi_command(const MultiKeyCommand &command, const uint64_t tcp_id) {
+	// key 一律移动，不复制：按分片拆开的 key 最后会移动进响应里的 ValueItem。
+	void send_multi_command(MultiKeyCommand &&command, const uint64_t tcp_id) {
 		auto session_it = tcp_session_.find(tcp_id);
 		if (session_it == tcp_session_.end() || !session_it->second || session_it->second->closing) {
 			return;
 		}
-		const std::vector<ItemKey> &item_keys = command.item_keys();
-		uint16_t counter = 0;
-		for (size_t i = 0; i < item_keys.size(); i++) {
-			std::size_t shard = shard_comm_.get_shard(item_keys[i].hash);
-			if (!multi_key_index_[shard].has_value()) {
-				counter++;
-				multi_key_index_[shard] = std::vector<ItemKey>{item_keys[i]};
-			} else {
-				multi_key_index_[shard].value().emplace_back(item_keys[i]);
-			}
-		}
+		std::vector<ItemKey> &item_keys = command.item_keys();
 		const uint32_t seq = session_it->second->seq++;
 
-		for (size_t i = 0; i < multi_key_index_.size(); i++) {
-			if (!multi_key_index_[i].has_value()) {
-				continue;
-			}
-			MultiKeyCommand multi_key_command = rebuild(command, std::move(*multi_key_index_[i]));
-			multi_key_index_[i].reset();
+		// 所有 key 落在同一个分片时整条命令原样转交，不拆分、不重新分配 key 数组。
+		const std::size_t first_shard =
+		    item_keys.empty() ? current_shard_id() : shard_comm_.get_shard(item_keys[0].hash);
+		const bool single_shard = std::all_of(item_keys.begin(), item_keys.end(), [&](const ItemKey &key) {
+			return shard_comm_.get_shard(key.hash) == first_shard;
+		});
+		if (single_shard) {
+			dispatch_multi_command(std::move(command), first_shard, 1, tcp_id, seq);
+			return;
+		}
 
-			if (shard_comm_.is_current_shard(i)) {
-				// Handle the local shard exactly once; sending it through the
-				// mailbox would duplicate the work and add avoidable latency.
-				MultiKeyResponse response = data_.handle_multi_command(multi_key_command);
-				ResponseMessage response_message = {
-					.tcp_id = tcp_id,
-					.seq = seq,
-					.shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-					.data = ResponseData{ShardResponse{.count = counter, .command = std::move(response)}}};
-				handle_response_message(std::move(response_message));
-				continue;
+		uint16_t counter = 0;
+		try {
+			for (ItemKey &key : item_keys) {
+				auto &bucket = multi_key_index_[shard_comm_.get_shard(key.hash)];
+				if (!bucket) {
+					++counter;
+					bucket.emplace();
+				}
+				bucket->push_back(std::move(key));
 			}
-
-			MultiKeyRequest request = {.count = counter, .command = std::move(multi_key_command)};
-			RequestMessage request_message = {.tcp_id = tcp_id,
-			                                  .seq = seq,
-			                                  .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-			                                  .data = RequestData{std::move(request)}};
-			shard_comm_.send_request_to_shard(i, std::make_unique<RequestMessage>(std::move(request_message)));
+			for (std::size_t i = 0; i < multi_key_index_.size(); i++) {
+				if (!multi_key_index_[i]) {
+					continue;
+				}
+				MultiKeyCommand part = rebuild(command, std::move(*multi_key_index_[i]));
+				multi_key_index_[i].reset();
+				dispatch_multi_command(std::move(part), i, counter, tcp_id, seq);
+			}
+		} catch (...) {
+			// 下一条命令不能看到本次残留的 key。
+			for (auto &bucket : multi_key_index_) {
+				bucket.reset();
+			}
+			throw;
 		}
 	}
 
@@ -219,17 +223,17 @@ public:
 		const uint32_t seq = session_it->second->seq++;
 		if (shard_comm_.is_current_shard(shard)) {
 			auto response = data_.handle_single_command(std::move(command));
-			//在当前分片 那么直接处理
-			handle_response_message(ResponseMessage{.tcp_id = tcp_id,
-			                                                 .seq = seq,
-			                                                 .shard_id = static_cast<uint16_t>(current_shard_id()),
-			                                                 .data = ResponseData{std::move(response)}});
+			// 在当前分片 那么直接处理
+			handle_response_message(ResponseMessage {.tcp_id = tcp_id,
+			                                         .seq = seq,
+			                                         .shard_id = static_cast<uint16_t>(current_shard_id()),
+			                                         .data = ResponseData {std::move(response)}});
 			return;
 		}
 		RequestMessage request_message = {.tcp_id = tcp_id,
 		                                  .seq = seq,
 		                                  .shard_id = static_cast<uint16_t>(current_shard_id()),
-		                                  .data = RequestData{SingleKeyRequest{std::move(command)}}};
+		                                  .data = RequestData {SingleKeyRequest {std::move(command)}}};
 		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(std::move(request_message)));
 	}
 
@@ -248,10 +252,10 @@ public:
 		if (rejected_set_key) {
 			const std::size_t shard = shard_comm_.get_shard(rejected_set_key->hash);
 			if (!shard_comm_.is_current_shard(shard)) {
-				RequestMessage request{.tcp_id = tcp_id,
-				                       .seq = seq,
-				                       .shard_id = static_cast<uint16_t>(current_shard_id()),
-				                       .data = RejectedSetRequest{std::move(*rejected_set_key), std::move(response)}};
+				RequestMessage request {.tcp_id = tcp_id,
+				                        .seq = seq,
+				                        .shard_id = static_cast<uint16_t>(current_shard_id()),
+				                        .data = RejectedSetRequest {std::move(*rejected_set_key), std::move(response)}};
 				shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(std::move(request)));
 				return;
 			}
@@ -259,10 +263,10 @@ public:
 		}
 		// Errors use the same ordered response path, without a mailbox hop or
 		// a heap-allocated message on the connection's owning shard.
-		handle_response_message(ResponseMessage{.tcp_id = tcp_id,
-		                                                 .seq = seq,
-		                                                 .shard_id = static_cast<uint16_t>(current_shard_id()),
-		                                                 .data = ResponseData{std::move(response)}});
+		handle_response_message(ResponseMessage {.tcp_id = tcp_id,
+		                                         .seq = seq,
+		                                         .shard_id = static_cast<uint16_t>(current_shard_id()),
+		                                         .data = ResponseData {std::move(response)}});
 	}
 
 	void finish_swallow(const uint64_t tcp_id) {
@@ -286,18 +290,19 @@ private:
 	void handle_request_message(const std::unique_ptr<RequestMessage> &message) {
 		auto &cmd = message->data;
 		ResponseData res = std::visit(
-			[&, this](auto &c) -> ResponseData {
-				using T = std::decay_t<decltype(c)>;
-				if constexpr (std::is_same_v<T, SingleKeyRequest>) {
-					return data_.handle_single_command(std::move(c.command));
-				} else if constexpr (std::is_same_v<T, MultiKeyRequest>) {
-					return ShardResponse{.count = c.count, .command = data_.handle_multi_command(c.command)};
-				} else if constexpr (std::is_same_v<T, RejectedSetRequest>) {
-					data_.erase_rejected_set(c.key);
-					return std::move(c.response);
-				}
-			},
-			cmd);
+		    [&, this](auto &c) -> ResponseData {
+			    using T = std::decay_t<decltype(c)>;
+			    if constexpr (std::is_same_v<T, SingleKeyRequest>) {
+				    return data_.handle_single_command(std::move(c.command));
+			    } else if constexpr (std::is_same_v<T, MultiKeyRequest>) {
+				    return ShardResponse {.count = c.count,
+				                          .command = data_.handle_multi_command(std::move(c.command))};
+			    } else if constexpr (std::is_same_v<T, RejectedSetRequest>) {
+				    data_.erase_rejected_set(c.key);
+				    return std::move(c.response);
+			    }
+		    },
+		    cmd);
 		// 响应发回请求的发送方；响应里的 shard_id 填自己（响应的发送方）
 		ResponseMessage response_message = {.tcp_id = message->tcp_id,
 		                                    .seq = message->seq,
@@ -305,6 +310,28 @@ private:
 		                                    .data = std::move(res)};
 		shard_comm_.send_response_shard(message->shard_id,
 		                                std::make_unique<ResponseMessage>(std::move(response_message)));
+	}
+
+	// count 是这条多 key 请求一共拆成了几个分片。
+	void dispatch_multi_command(MultiKeyCommand &&command, const std::size_t shard, const uint16_t count,
+	                            const uint64_t tcp_id, const uint32_t seq) {
+		if (shard_comm_.is_current_shard(shard)) {
+			// Handle the local shard exactly once; sending it through the
+			// mailbox would duplicate the work and add avoidable latency.
+			MultiKeyResponse response = data_.handle_multi_command(std::move(command));
+			handle_response_message(ResponseMessage {
+			    .tcp_id = tcp_id,
+			    .seq = seq,
+			    .shard_id = static_cast<uint16_t>(current_shard_id()),
+			    .data = ResponseData {ShardResponse {.count = count, .command = std::move(response)}}});
+			return;
+		}
+		RequestMessage request_message = {
+		    .tcp_id = tcp_id,
+		    .seq = seq,
+		    .shard_id = static_cast<uint16_t>(current_shard_id()),
+		    .data = RequestData {MultiKeyRequest {.count = count, .command = std::move(command)}}};
+		shard_comm_.send_request_to_shard(shard, std::make_unique<RequestMessage>(std::move(request_message)));
 	}
 
 	// ---- Worker private ----
@@ -324,7 +351,7 @@ private:
 		kick_write(tcp_id, session);
 	}
 
-	// 只有当前的线程会调用这个方法。
+	// 只有当前的线程会调用这个方法，因为能放进ring的只有连接所属的线程。分别是当前分片命中和跨分片然后唤醒mailbox_response_loop导致放入的。
 	// 写路径只入队、不等待：本分片 inline 路径、mailbox、错误和 finish_swallow 都调用这里。
 	// 同一连接同一时刻最多一个 async_write 在途；在途期间新就绪的响应留在环形数组，写完成后作为下一批一起发出。
 	// 调用后 session 可能已被回收，调用方不能再访问它。
@@ -372,6 +399,7 @@ private:
 
 		session.writing = true;
 		maybe_resume_read(session);
+		// 把buffer里的数据异步写完，然后完成回调。
 		asio::async_write(session.socket, session.out.buffers(),
 		                  [this, tcp_id, close_after](const boost::system::error_code &ec, std::size_t) {
 			                  on_write_complete(tcp_id, ec, close_after);
@@ -406,20 +434,20 @@ private:
 		const GatherSink::Mark mark = out.mark();
 		try {
 			return std::visit(
-				[&out](const auto &value) -> bool {
-					using T = std::remove_cvref_t<decltype(value)>;
-					if constexpr (std::is_same_v<T, ShardResponse>) {
-						return encode_to(out, value.command);
-					} else {
-						return encode_to(out, value);
-					}
-				},
-				data);
+			    [&out](const auto &value) -> bool {
+				    using T = std::remove_cvref_t<decltype(value)>;
+				    if constexpr (std::is_same_v<T, ShardResponse>) {
+					    return encode_to(out, value.command);
+				    } else {
+					    return encode_to(out, value);
+				    }
+			    },
+			    data);
 		} catch (const std::logic_error &e) {
 			// invalid_argument 是它的子类
 			spdlog::error("[shard {}] encode failed: {}", current_shard_id(), e.what());
 			out.rollback(mark);
-			const ErrorResponse err{.kind = ResponseErrorKind::ServerError, .message = "response encoding failed"};
+			const ErrorResponse err {.kind = ResponseErrorKind::ServerError, .message = "response encoding failed"};
 			return encode_to(out, err);
 		}
 	}
@@ -446,7 +474,7 @@ private:
 	Sc shard_comm_;
 	ShardCache data_;
 	// 长度和CPU核心数一样
-	std::vector<std::optional<std::vector<ItemKey> > > multi_key_index_;
+	std::vector<std::optional<std::vector<ItemKey>>> multi_key_index_;
 	std::shared_ptr<std::atomic_bool> stop_;
 };
 } // namespace fastest

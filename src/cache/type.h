@@ -1,13 +1,16 @@
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace fastest {
@@ -59,7 +62,6 @@ private:
 	std::uint64_t seed_;
 };
 
-using Value = std::string;
 using Key = std::string;
 
 struct ItemKey {
@@ -67,15 +69,9 @@ struct ItemKey {
 	Key key;
 
 	explicit ItemKey(Key k)
-		: hash(FastByteHash{}(std::as_bytes(std::span<const char>{k.data(), k.size()}))), key(std::move(k)) {
+	    : hash(FastByteHash {}(std::as_bytes(std::span<const char> {k.data(), k.size()}))), key(std::move(k)) {
 	}
 };
-
-struct Item {
-	std::uint32_t flags = 0;
-	Value value;
-};
-
 
 // 从裸指针拿到智能指针只有两个入口，名字写明是否 +1：
 //   adopt(p)：接管 p 已有的那次计数（create() 内部、从 map 摘下来的指针）
@@ -84,7 +80,9 @@ class CacheValuePtr {
 public:
 	CacheValuePtr() noexcept = default;
 
-	[[nodiscard]] static CacheValuePtr adopt(CacheValue *p) noexcept { return CacheValuePtr(p); }
+	[[nodiscard]] static CacheValuePtr adopt(CacheValue *p) noexcept {
+		return CacheValuePtr(p);
+	}
 
 	[[nodiscard]] static CacheValuePtr share(CacheValue *p) noexcept;
 
@@ -101,14 +99,26 @@ public:
 
 	~CacheValuePtr();
 
-	void reset() noexcept { *this = CacheValuePtr(); }
+	void reset() noexcept {
+		*this = CacheValuePtr();
+	}
 	// 交出这次计数（例如交给 map），调用者负责以后 release()。
-	[[nodiscard]] CacheValue *release_ownership() noexcept { return std::exchange(ptr_, nullptr); }
+	[[nodiscard]] CacheValue *release_ownership() noexcept {
+		return std::exchange(ptr_, nullptr);
+	}
 
-	[[nodiscard]] CacheValue *get() const noexcept { return ptr_; }
-	CacheValue *operator->() const noexcept { return ptr_; }
-	CacheValue &operator*() const noexcept { return *ptr_; }
-	explicit operator bool() const noexcept { return ptr_ != nullptr; }
+	[[nodiscard]] CacheValue *get() const noexcept {
+		return ptr_;
+	}
+	CacheValue *operator->() const noexcept {
+		return ptr_;
+	}
+	CacheValue &operator*() const noexcept {
+		return *ptr_;
+	}
+	explicit operator bool() const noexcept {
+		return ptr_ != nullptr;
+	}
 
 private:
 	explicit CacheValuePtr(CacheValue *p) noexcept : ptr_(p) {
@@ -126,25 +136,40 @@ public:
 
 	CacheValue &operator=(const CacheValue &) = delete;
 
-
+	// 唯一一次拷贝 value 字节的地方：从输入缓冲区直接拷进最终的存储块。
 	[[nodiscard]] static CacheValuePtr create(std::span<const std::byte> payload, std::uint32_t flags = 0,
 	                                          std::uint32_t expired_at = 0, std::uint64_t cas = 0) {
-		if (payload.size() > std::numeric_limits<std::uint32_t>::max() - 2) {
+		CacheValuePtr v = create_for_overwrite(payload.size(), flags, expired_at, cas);
+		if (!payload.empty()) {
+			std::memcpy(v->payload(), payload.data(), payload.size());
+		}
+		return v;
+	}
+
+	[[nodiscard]] static CacheValuePtr create(std::string_view payload, std::uint32_t flags = 0,
+	                                          std::uint32_t expired_at = 0, std::uint64_t cas = 0) {
+		return create(std::as_bytes(std::span<const char>(payload.data(), payload.size())), flags, expired_at, cas);
+	}
+
+	// 只分配不初始化 payload（结尾已写好 \r\n）。用于把 socket 数据直接读进 value，省掉经过输入缓冲区的拷贝；
+	// 发布前由创建者通过 mutable_bytes_crlf() 填满。
+	[[nodiscard]] static CacheValuePtr create_for_overwrite(std::size_t size, std::uint32_t flags = 0,
+	                                                        std::uint32_t expired_at = 0, std::uint64_t cas = 0) {
+		if (size > std::numeric_limits<std::uint32_t>::max() - 2) {
 			throw std::length_error("CacheValue payload exceeds uint32_t");
 		}
-		void *mem = ::operator new(sizeof(CacheValue) + payload.size() + 2);
-		auto *v = ::new(mem) CacheValue(cas, flags, expired_at, static_cast<std::uint32_t>(payload.size()));
+		void *mem = ::operator new(sizeof(CacheValue) + size + 2);
+		auto *v = ::new (mem) CacheValue(cas, flags, expired_at, static_cast<std::uint32_t>(size));
 		std::byte *p = v->payload();
-		if (!payload.empty()) {
-			std::memcpy(p, payload.data(), payload.size());
-		}
-		p[payload.size()] = std::byte{'\r'};
-		p[payload.size() + 1] = std::byte{'\n'};
+		p[size] = std::byte {'\r'};
+		p[size + 1] = std::byte {'\n'};
 		return CacheValuePtr::adopt(v);
 	}
 
 	// 调用者已经持有一次计数，relaxed 足够；跨线程可见性靠 mailbox 的 push/pop。
-	void retain() const noexcept { ref_count_.fetch_add(1, std::memory_order_relaxed); }
+	void retain() const noexcept {
+		ref_count_.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	// 归零时销毁；调用后不得再访问 this。
 	void release() const noexcept {
@@ -154,12 +179,32 @@ public:
 		}
 	}
 
-	[[nodiscard]] std::uint32_t use_count() const noexcept { return ref_count_.load(std::memory_order_relaxed); }
-	[[nodiscard]] std::size_t size() const noexcept { return size_; }
-	[[nodiscard]] std::span<const std::byte> bytes() const noexcept { return {payload(), size_}; }
+	[[nodiscard]] std::uint32_t use_count() const noexcept {
+		return ref_count_.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] std::size_t size() const noexcept {
+		return size_;
+	}
+	[[nodiscard]] std::span<const std::byte> bytes() const noexcept {
+		return {payload(), size_};
+	}
 	// 带 \r\n，编码时直接作为一个 iovec。
-	[[nodiscard]] std::span<const std::byte> bytes_crlf() const noexcept { return {payload(), size_ + std::size_t{2}}; }
-	[[nodiscard]] std::size_t memory_usage() const noexcept { return sizeof(CacheValue) + size_ + 2; }
+	[[nodiscard]] std::span<const std::byte> bytes_crlf() const noexcept {
+		return {payload(), size_ + std::size_t {2}};
+	}
+	[[nodiscard]] std::string_view view() const noexcept {
+		return {reinterpret_cast<const char *>(payload()), size_};
+	}
+	[[nodiscard]] std::string_view view_crlf() const noexcept {
+		return {reinterpret_cast<const char *>(payload()), size_ + std::size_t {2}};
+	}
+	// 仅限发布前（还没插进 map、也没 share 给别的线程）由唯一持有者写入；结尾两个字节是 CRLF 槽位。
+	[[nodiscard]] std::span<std::byte> mutable_bytes_crlf() noexcept {
+		return {payload(), size_ + std::size_t {2}};
+	}
+	[[nodiscard]] std::size_t memory_usage() const noexcept {
+		return sizeof(CacheValue) + size_ + 2;
+	}
 
 	std::uint64_t cas = 0;
 	std::uint32_t flags = 0;
@@ -167,7 +212,7 @@ public:
 
 private:
 	CacheValue(std::uint64_t c, std::uint32_t f, std::uint32_t e, std::uint32_t n) noexcept
-		: cas(c), flags(f), expired_at(e), size_(n) {
+	    : cas(c), flags(f), expired_at(e), size_(n) {
 	}
 
 	// 私有析构：delete、make_unique、map_.destroy_value() 都编译不过，只能走 release()。
@@ -177,7 +222,7 @@ private:
 		return reinterpret_cast<std::byte *>(const_cast<CacheValue *>(this) + 1);
 	}
 
-	mutable std::atomic<std::uint32_t> ref_count_{1};
+	mutable std::atomic<std::uint32_t> ref_count_ {1};
 	std::uint32_t size_ = 0;
 };
 
@@ -198,4 +243,4 @@ inline CacheValuePtr::~CacheValuePtr() {
 	if (ptr_)
 		ptr_->release();
 }
-}
+} // namespace fastest

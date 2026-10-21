@@ -23,11 +23,13 @@ add_executable(fastest
         src/main.cpp
         src/cache/core_cache.h
         src/util/hardware_info.h
+        src/server/comm/input_buffer.h
         src/server/comm/ring_array.h
         src/server/comm/mailbox.h
         src/server/comm/worker.h
         src/server/comm/shard.h
         src/server/comm/shard.h
+        src/util/clock.h
         src/util/hash.h
         src/server/comm/handler.h
         src/server/comm/type.h
@@ -79,7 +81,7 @@ add_test(NAME fastest_tests COMMAND fastest_tests)
 add_executable(fastest_protocol_tests tests/test_protocol.cpp)
 target_include_directories(fastest_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(fastest_protocol_tests PRIVATE
-        Boost::asio Boost::system Boost::lockfree spdlog::spdlog Catch2::Catch2WithMain)
+        Boost::asio Boost::intrusive Boost::system Boost::lockfree spdlog::spdlog Catch2::Catch2WithMain)
 add_test(NAME fastest_protocol_tests COMMAND fastest_protocol_tests)
 
 
