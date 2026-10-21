@@ -20,7 +20,7 @@ using asio::ip::tcp;
 
 struct TCPSession {
 	// 背压：已分配序号、但还没交给写操作的请求数（backlog）超过高水位时暂停读，降到低水位以下再恢复。
-	static constexpr uint32_t kPauseReadBacklog = 1024;
+	static constexpr uint32_t kPauseReadBacklog = 2048;
 	static constexpr uint32_t kResumeReadBacklog = 256;
 
 	// 注意：resume_read 的初始化依赖 socket，socket 必须声明在 resume_read 之前；

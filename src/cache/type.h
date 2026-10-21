@@ -11,6 +11,8 @@
 #include <utility>
 
 namespace fastest {
+class CacheValue;
+
 class FastByteHash {
 public:
 	static constexpr std::uint64_t goldenRatio = 0x9e3779b97f4a7c15ULL;
@@ -65,7 +67,7 @@ struct ItemKey {
 	Key key;
 
 	explicit ItemKey(Key k)
-	    : hash(FastByteHash {}(std::as_bytes(std::span<const char> {k.data(), k.size()}))), key(std::move(k)) {
+		: hash(FastByteHash{}(std::as_bytes(std::span<const char>{k.data(), k.size()}))), key(std::move(k)) {
 	}
 };
 
@@ -74,165 +76,126 @@ struct Item {
 	Value value;
 };
 
-// 用于 parser -> mailbox -> shard 之间传递 payload 的所有权。
-// copy_of() 分配并复制一次；移动操作不复制 payload 字节。
-class ByteBuffer {
+
+// 从裸指针拿到智能指针只有两个入口，名字写明是否 +1：
+//   adopt(p)：接管 p 已有的那次计数（create() 内部、从 map 摘下来的指针）
+//   share(p)：新增一次计数（map_.find() 返回的是 map 借给你的指针）
+class CacheValuePtr {
 public:
-	using size_type = std::uint32_t;
+	CacheValuePtr() noexcept = default;
 
-	ByteBuffer() noexcept = default;
+	[[nodiscard]] static CacheValuePtr adopt(CacheValue *p) noexcept { return CacheValuePtr(p); }
 
-	ByteBuffer(const ByteBuffer &) = delete;
+	[[nodiscard]] static CacheValuePtr share(CacheValue *p) noexcept;
 
-	ByteBuffer &operator=(const ByteBuffer &) = delete;
+	CacheValuePtr(const CacheValuePtr &other) noexcept;
 
-	ByteBuffer(ByteBuffer &&other) noexcept : data_(std::move(other.data_)), size_(std::exchange(other.size_, 0)) {
+	CacheValuePtr(CacheValuePtr &&other) noexcept : ptr_(std::exchange(other.ptr_, nullptr)) {
 	}
 
-	ByteBuffer &operator=(ByteBuffer &&other) noexcept {
-		if (this != &other) {
-			data_ = std::move(other.data_);
-			size_ = std::exchange(other.size_, 0);
-		}
+	// copy-and-swap：拷贝和移动共用一个；旧值在形参析构时释放，自赋值也安全。
+	CacheValuePtr &operator=(CacheValuePtr other) noexcept {
+		std::swap(ptr_, other.ptr_);
 		return *this;
 	}
 
-	[[nodiscard]] static constexpr std::size_t max_size() noexcept {
-		return std::numeric_limits<size_type>::max();
-	}
+	~CacheValuePtr();
 
-	[[nodiscard]] static ByteBuffer copy_of(std::span<const std::byte> input) {
-		// 在分配和类型转换前检查，避免长度截断。
-		if (input.size() > max_size()) {
-			throw std::length_error("ByteBuffer payload exceeds uint32_t");
-		}
+	void reset() noexcept { *this = CacheValuePtr(); }
+	// 交出这次计数（例如交给 map），调用者负责以后 release()。
+	[[nodiscard]] CacheValue *release_ownership() noexcept { return std::exchange(ptr_, nullptr); }
 
-		ByteBuffer result;
-		if (!input.empty()) {
-			result.data_ = std::make_unique_for_overwrite<std::byte[]>(input.size());
-			result.size_ = static_cast<size_type>(input.size());
-			std::memcpy(result.data_.get(), input.data(), input.size());
-		}
-		return result;
-	}
-
-	[[nodiscard]] const std::byte *data() const noexcept {
-		return data_.get();
-	}
-
-	[[nodiscard]] std::size_t size() const noexcept {
-		return size_;
-	}
-
-	[[nodiscard]] std::span<const std::byte> bytes() const noexcept {
-		return {data_.get(), size_};
-	}
-
-	// 只统计请求的堆字节数，不包含分配器元数据和大小分级取整。
-	[[nodiscard]] std::size_t heap_bytes() const noexcept {
-		return size_;
-	}
-
-	[[nodiscard]] std::size_t memory_usage() const noexcept {
-		return sizeof(ByteBuffer) + heap_bytes();
-	}
+	[[nodiscard]] CacheValue *get() const noexcept { return ptr_; }
+	CacheValue *operator->() const noexcept { return ptr_; }
+	CacheValue &operator*() const noexcept { return *ptr_; }
+	explicit operator bool() const noexcept { return ptr_ != nullptr; }
 
 private:
-	friend struct CacheValue;
+	explicit CacheValuePtr(CacheValue *p) noexcept : ptr_(p) {
+	}
 
-	std::unique_ptr<std::byte[]> data_;
-	size_type size_ = 0;
+	CacheValue *ptr_ = nullptr;
 };
 
-// 兼容旧名称；不依赖 mimalloc，也不提供 charge_to()。
-using MimallocBuffer = ByteBuffer;
-
-// 常见 64 位 ABI 布局：
-// cas        : 8 字节
-// flags      : 4 字节
-// expired_at : 4 字节
-// sample_num : 4 字节
-// size_      : 4 字节
-// data_      : 8 字节
-// 合计 32 字节。payload 堆空间单独计算。
-struct CacheValue {
-	std::uint64_t cas = 0;
-	std::uint32_t flags = 0;
-	std::uint32_t expired_at = 0;
-	// 给lru和LFU预留的近似采样编号，类似redis
-	std::uint32_t sample_num = 0;
-
-	CacheValue() noexcept = default;
-
+// 一次分配：[CacheValue 24B][payload][\r\n]。
+// 发布后（插进 map 或 share 给别的线程）：payload、cas、flags 只读；
+// expired_at 只有 owner 线程读写（touch/gat 原地改），远端线程不得读。
+class CacheValue {
+public:
 	CacheValue(const CacheValue &) = delete;
 
 	CacheValue &operator=(const CacheValue &) = delete;
 
-	// ByteBuffer 已经保证长度在 uint32_t 范围内。
-	explicit CacheValue(ByteBuffer &&buffer) noexcept
-	    : size_(std::exchange(buffer.size_, 0)), data_(std::move(buffer.data_)) {
-	}
 
-	// 传入全部字段；payload 所有权转移，不复制字节。
-	CacheValue(const std::uint64_t cas_value, const std::uint32_t flags_value, const std::uint32_t expired_at_value,
-	           ByteBuffer &&buffer) noexcept
-	    : cas(cas_value), flags(flags_value), expired_at(expired_at_value), size_(std::exchange(buffer.size_, 0)),
-	      data_(std::move(buffer.data_)) {
-	}
-
-	CacheValue(CacheValue &&other) noexcept
-	    : cas(other.cas), flags(other.flags), expired_at(other.expired_at), sample_num(other.sample_num),
-	      size_(std::exchange(other.size_, 0)), data_(std::move(other.data_)) {
-	}
-
-	CacheValue &operator=(CacheValue &&other) noexcept {
-		if (this != &other) {
-			data_ = std::move(other.data_);
-			size_ = std::exchange(other.size_, 0);
-			cas = other.cas;
-			flags = other.flags;
-			expired_at = other.expired_at;
-			sample_num = other.sample_num;
+	[[nodiscard]] static CacheValuePtr create(std::span<const std::byte> payload, std::uint32_t flags = 0,
+	                                          std::uint32_t expired_at = 0, std::uint64_t cas = 0) {
+		if (payload.size() > std::numeric_limits<std::uint32_t>::max() - 2) {
+			throw std::length_error("CacheValue payload exceeds uint32_t");
 		}
-		return *this;
+		void *mem = ::operator new(sizeof(CacheValue) + payload.size() + 2);
+		auto *v = ::new(mem) CacheValue(cas, flags, expired_at, static_cast<std::uint32_t>(payload.size()));
+		std::byte *p = v->payload();
+		if (!payload.empty()) {
+			std::memcpy(p, payload.data(), payload.size());
+		}
+		p[payload.size()] = std::byte{'\r'};
+		p[payload.size() + 1] = std::byte{'\n'};
+		return CacheValuePtr::adopt(v);
 	}
 
-	[[nodiscard]] static CacheValue copy_of(std::span<const std::byte> input) {
-		return CacheValue {ByteBuffer::copy_of(input)};
+	// 调用者已经持有一次计数，relaxed 足够；跨线程可见性靠 mailbox 的 push/pop。
+	void retain() const noexcept { ref_count_.fetch_add(1, std::memory_order_relaxed); }
+
+	// 归零时销毁；调用后不得再访问 this。
+	void release() const noexcept {
+		if (ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+			this->~CacheValue();
+			::operator delete(const_cast<CacheValue *>(this));
+		}
 	}
 
-	// 替换 payload，保留 cas 和 flags，不复制 payload 字节。
-	void set_payload(ByteBuffer &&buffer) noexcept {
-		data_ = std::move(buffer.data_);
-		size_ = std::exchange(buffer.size_, 0);
-	}
+	[[nodiscard]] std::uint32_t use_count() const noexcept { return ref_count_.load(std::memory_order_relaxed); }
+	[[nodiscard]] std::size_t size() const noexcept { return size_; }
+	[[nodiscard]] std::span<const std::byte> bytes() const noexcept { return {payload(), size_}; }
+	// 带 \r\n，编码时直接作为一个 iovec。
+	[[nodiscard]] std::span<const std::byte> bytes_crlf() const noexcept { return {payload(), size_ + std::size_t{2}}; }
+	[[nodiscard]] std::size_t memory_usage() const noexcept { return sizeof(CacheValue) + size_ + 2; }
 
-	[[nodiscard]] const std::byte *data() const noexcept {
-		return data_.get();
-	}
-
-	[[nodiscard]] std::size_t size() const noexcept {
-		return size_;
-	}
-
-	[[nodiscard]] std::span<const std::byte> bytes() const noexcept {
-		return {data_.get(), size_};
-	}
-
-	[[nodiscard]] std::size_t heap_bytes() const noexcept {
-		return size_;
-	}
-
-	// 对象内联存储统计一次，再加 payload 请求的堆字节数。
-	[[nodiscard]] std::size_t memory_usage() const noexcept {
-		return sizeof(CacheValue) + heap_bytes();
-	}
+	std::uint64_t cas = 0;
+	std::uint32_t flags = 0;
+	std::uint32_t expired_at = 0;
 
 private:
+	CacheValue(std::uint64_t c, std::uint32_t f, std::uint32_t e, std::uint32_t n) noexcept
+		: cas(c), flags(f), expired_at(e), size_(n) {
+	}
+
+	// 私有析构：delete、make_unique、map_.destroy_value() 都编译不过，只能走 release()。
+	~CacheValue() = default;
+
+	std::byte *payload() const noexcept {
+		return reinterpret_cast<std::byte *>(const_cast<CacheValue *>(this) + 1);
+	}
+
+	mutable std::atomic<std::uint32_t> ref_count_{1};
 	std::uint32_t size_ = 0;
-	std::unique_ptr<std::byte[]> data_;
 };
 
-// 若项目要求常见 64 位 ABI 下固定为 24 字节，可启用：
-// static_assert(sizeof(CacheValue) == 32);
-} // namespace fastest
+static_assert(sizeof(CacheValue) == 24);
+
+inline CacheValuePtr CacheValuePtr::share(CacheValue *p) noexcept {
+	if (p)
+		p->retain();
+	return CacheValuePtr(p);
+}
+
+inline CacheValuePtr::CacheValuePtr(const CacheValuePtr &other) noexcept : ptr_(other.ptr_) {
+	if (ptr_)
+		ptr_->retain();
+}
+
+inline CacheValuePtr::~CacheValuePtr() {
+	if (ptr_)
+		ptr_->release();
+}
+}
