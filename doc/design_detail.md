@@ -25,7 +25,8 @@
 
 ## Value 的生命周期
 
-value 字节从 socket 到存储只拷贝一次，之后只传递 `CacheValuePtr`（侵入式 u32 引用计数）。
+value 字节从 socket 到存储只拷贝一次，之后只传递 `CacheValuePtr`（侵入式 u32 引用计数，普通整数，发布后只有 owner 读写）和
+借出凭证 `ValueLoan`（见 core_design.md「借出与归还」）。
 
 - 解析：数据块完整到达时，解析器把它直接拷进 `CacheValue::create()` 分配的最终存储块（一次分配：
   `[CacheValue 24B][payload][\r\n]`，flags 写在块头）。存储命令只持有 `CacheValuePtr`。
@@ -57,12 +58,12 @@ value 字节从 socket 到存储只拷贝一次，之后只传递 `CacheValuePtr
 - TTL 计数：`ExpiredMap` 用一个普通 `size_t`（分片线程私有，不用 atomic，不增加每个 pair 的内存）记录带过期时间的条目数。
   插入带过期时间的 value 加一；这样的条目被覆盖、delete、惰性删除、采样删除时减一。计数为 0 时 `sample_expired` 直接返回，
   不扫描、不读时钟。touch/gat 原地修改 `expired_at` 都经过 `ExpiredMap::touch()`，由它同步调整计数。
-- 读取：命中时 `CacheValuePtr::share()` 加一次计数放进响应，key 从命令移动进响应。value 发布后只读，跨线程共享安全；之后的覆盖或删除只释放
-  map 那一次计数，在途响应继续引用旧值直到写完成。gat/gats 命中时先改 `expired_at` 再返回（不改 cas）；远端在途响应不读 `expired_at`。
+- 读取：命中时 `ValueLoan::lend()` 加一次计数放进响应，key 从命令移动进响应。value 发布后只读，跨线程共享安全；之后的覆盖或删除只释放
+  map 那一次计数，在途响应继续引用旧值直到写完成、归还记录送回 owner。gat/gats 命中时先改 `expired_at` 再返回（不改 cas）；远端在途响应不读 `expired_at`。
 - incr/decr：结果与 memcached `do_add_delta` 逐字节相同。新数字不比旧数据长时长度不变、尾部补空格，变长时刚好装下数字；
-  flags、`expired_at` 不变，cas 换新。value 只被 map 持有时（`CacheValue::exclusively_owned()`，acquire 读计数，相当于
-  memcached 的 refcount == 2）原地改写，不分配；有在途响应引用时分配新 value，同样补空格，让结果不取决于同一连接流水线里
-  前一条回复何时写完（memcached 每条 get 的回复写完才执行下一条命令）。这是“发布后只读”的唯一例外。
+  flags、`expired_at` 不变，cas 换新。value 只被 map 持有时（`CacheValue::exclusively_owned()`，owner 读自己的计数，相当于
+  memcached 的 refcount == 2）原地改写，不分配；有在途响应引用（或者归还记录还没送到）时分配新 value，同样补空格，让结果不取决于
+  同一连接流水线里前一条回复何时写完、归还何时送到（memcached 每条 get 的回复写完才执行下一条命令）。这是“发布后只读”的唯一例外。
 - 发送：编码直接输出 `view_crlf()`。超过 256 字节的 value 作为独立 iovec 直接引用 CacheValue；不超过 256 字节的拷进发送
   arena 与协议文本合并，用一次小拷贝换更少的 iovec 和系统调用。
 - 多 key：key 按分片移动拆分；全部落在同一分片时整条命令原样转交，不拆分。

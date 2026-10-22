@@ -1,9 +1,9 @@
 #pragma once
 
-#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -73,9 +73,11 @@ struct ItemKey {
 	}
 };
 
+// 所有者一侧的智能指针：命令持有尚未发布的 value，map 接管它那次计数；拷贝、share()、析构都直接改计数，
+// 所以 value 发布之后只能在所属分片（owner）线程上拷贝或析构。跨分片的响应不用它，用 ValueLoan。
 // 从裸指针拿到智能指针只有两个入口，名字写明是否 +1：
 //   adopt(p)：接管 p 已有的那次计数（create() 内部、从 map 摘下来的指针）
-//   share(p)：新增一次计数（map_.find() 返回的是 map 借给你的指针）
+//   share(p)：新增一次计数（owner 线程上，map_.find() 返回的是 map 借给你的指针）
 class CacheValuePtr {
 public:
 	CacheValuePtr() noexcept = default;
@@ -128,10 +130,17 @@ private:
 };
 
 // 一次分配：[CacheValue 24B][payload][\r\n]。
-// 发布后（插进 map 或 share 给别的线程）：payload、cas、flags 只读；
+// 发布后（插进 map 或借给别的线程）：payload、cas、flags、size 只读；
 // expired_at 只有 owner 线程读写（touch/gat 原地改），远端线程不得读。
 // 唯一的例外是 incr/decr：owner 线程在 exclusively_owned()（只有 map 持有）时原地改写数字和 cas，
 // 对应 memcached 在 refcount == 2 时的原地替换；有在途引用时改为分配新 value（见 ShardCache::store_number）。
+//
+// 引用计数是普通整数，不是 atomic：发布之后只有 owner 线程读写它。
+// - 命令持有尚未发布的 value（计数 1）：在连接线程创建，经信封交给 owner，队列的 push/pop 提供 happens-before；
+// - map 持有一次；owner 借出（ValueLoan::lend）时加一；
+// - 远端用完后不改计数，而是把指针送回 owner（ValueLoan 析构 → LoanSink），由 owner 减一、归零时释放。
+//   远端「读 payload → 写完成 → 归还记录进信封 → push（release）」，owner「pop（acquire）→ 减一 → 可能原地改写或释放」，
+//   所以 owner 看到计数回到 1 或 0 时，远端对 payload 和头部字段的读取都已经结束。
 class CacheValue {
 public:
 	CacheValue(const CacheValue &) = delete;
@@ -168,28 +177,27 @@ public:
 		return CacheValuePtr::adopt(v);
 	}
 
-	// 调用者已经持有一次计数，relaxed 足够；跨线程可见性靠 mailbox 的 push/pop。
+	// 只能在 owner 线程上调用（发布前是唯一持有者所在的线程）。
 	void retain() const noexcept {
-		ref_count_.fetch_add(1, std::memory_order_relaxed);
+		++ref_count_;
 	}
 
-	// 归零时销毁；调用后不得再访问 this。
+	// 归零时销毁；调用后不得再访问 this。只能在 owner 线程上调用：远端归还走 ValueLoan → LoanSink。
 	void release() const noexcept {
-		if (ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+		if (--ref_count_ == 0) {
 			this->~CacheValue();
 			::operator delete(const_cast<CacheValue *>(this));
 		}
 	}
 
 	[[nodiscard]] std::uint32_t use_count() const noexcept {
-		return ref_count_.load(std::memory_order_relaxed);
+		return ref_count_;
 	}
 
-	// 已发布的 value 是否只剩调用者这一份引用（例如只有 map 持有，没有在途响应）。
-	// acquire 与其他线程 release() 的 acq_rel 配对：它们对 payload 的读取先于之后的原地改写。
-	// 只有 owner 线程能新增引用（share() 只在 owner 线程的 map 查找后调用），所以结果在 owner 线程上不会失效。
+	// 已发布的 value 是否只剩调用者这一份引用（只有 map 持有，没有借出、或借出的都已归还）。
+	// 只有 owner 线程读写计数，远端的读取在归还之前完成（见类注释），所以结果在 owner 线程上不会失效。
 	[[nodiscard]] bool exclusively_owned() const noexcept {
-		return ref_count_.load(std::memory_order_acquire) == 1;
+		return ref_count_ == 1;
 	}
 	[[nodiscard]] std::size_t size() const noexcept {
 		return size_;
@@ -232,11 +240,108 @@ private:
 		return reinterpret_cast<std::byte *>(const_cast<CacheValue *>(this) + 1);
 	}
 
-	mutable std::atomic<std::uint32_t> ref_count_ {1};
+	mutable std::uint32_t ref_count_ {1}; // 只有 owner 线程读写，见类注释
 	std::uint32_t size_ = 0;
 };
 
 static_assert(sizeof(CacheValue) == 24);
+
+// 归还借出的 value：每个分片线程绑定一个（Worker），ValueLoan 析构时把指针交给它。
+// owner 就是当前分片时直接 release()；否则记下来，搭发往 owner 的信封送回去，由 owner release()。
+class LoanSink {
+public:
+	virtual void give_back(CacheValue *value, std::uint16_t owner) noexcept = 0;
+
+protected:
+	~LoanSink() = default;
+};
+
+// 当前线程的归还出口。分片线程启动时绑定（Worker::bind_thread），常量初始化，访问不经过 TLS 包装函数。
+// 为空表示这个线程上没有分片在运行（单线程的单元测试、停机后的析构），这时直接在本线程 release()：
+// 只有在 owner 线程不会同时运行时才成立。
+inline constinit thread_local LoanSink *tls_loan_sink = nullptr;
+
+// 借出凭证：跨分片（以及同分片）响应持有的 value 引用，只能移动，8 字节。
+// owner 线程 lend() 时加一次计数；凭证可以在任何分片线程上析构，析构时经 tls_loan_sink 送回 owner 减一，
+// 借用方从不改 value 的计数（没有原子操作，也不写 owner 的缓存行）。
+// 借用方只读：payload、flags、size、cas（发布后不变；incr 原地改写只发生在没有借出的时候）。
+// owner 分片号放在指针的高 16 位：用户态地址只用低 48 位（x86-64 / AArch64 的 4 级页表；5 级页表下内核也只在
+// mmap 显式给出高地址提示时才分配 47 位以上的地址），归还时不用再读 value 头或重算 key 的 hash。
+class ValueLoan {
+public:
+	ValueLoan() noexcept = default;
+
+	// 只能在 owner 线程上调用，value 必须已经由 owner 持有（例如刚从 map 里查到）。
+	[[nodiscard]] static ValueLoan lend(CacheValue *value, const std::uint16_t owner) noexcept {
+		value->retain();
+		return ValueLoan(value, owner);
+	}
+
+	ValueLoan(ValueLoan &&other) noexcept : bits_(std::exchange(other.bits_, 0)) {
+	}
+
+	ValueLoan &operator=(ValueLoan &&other) noexcept {
+		if (this != &other) {
+			give_back();
+			bits_ = std::exchange(other.bits_, 0);
+		}
+		return *this;
+	}
+
+	ValueLoan(const ValueLoan &) = delete;
+	ValueLoan &operator=(const ValueLoan &) = delete;
+
+	~ValueLoan() {
+		give_back();
+	}
+
+	[[nodiscard]] CacheValue *get() const noexcept {
+		return reinterpret_cast<CacheValue *>(bits_ & kAddressMask);
+	}
+	[[nodiscard]] std::uint16_t owner() const noexcept {
+		return static_cast<std::uint16_t>(bits_ >> kOwnerShift);
+	}
+	const CacheValue *operator->() const noexcept {
+		return get();
+	}
+	const CacheValue &operator*() const noexcept {
+		return *get();
+	}
+	explicit operator bool() const noexcept {
+		return bits_ != 0;
+	}
+
+private:
+	static constexpr unsigned kOwnerShift = 48;
+	static constexpr std::uintptr_t kAddressMask = (std::uintptr_t {1} << kOwnerShift) - 1;
+	static_assert(sizeof(std::uintptr_t) == 8, "ValueLoan packs the owner shard into a 64-bit pointer");
+
+	ValueLoan(CacheValue *value, const std::uint16_t owner) noexcept
+	    : bits_(reinterpret_cast<std::uintptr_t>(value) | (std::uintptr_t {owner} << kOwnerShift)) {
+		// 地址超出 48 位时分片号会把指针弄坏；这在支持的平台上不会发生，坏了就立刻停下，而不是悄悄写错内存。
+		if ((reinterpret_cast<std::uintptr_t>(value) & ~kAddressMask) != 0) [[unlikely]] {
+			std::abort();
+		}
+	}
+
+	void give_back() noexcept {
+		if (bits_ == 0) {
+			return;
+		}
+		CacheValue *const value = get();
+		const std::uint16_t owner_shard = owner();
+		bits_ = 0;
+		if (LoanSink *const sink = tls_loan_sink) {
+			sink->give_back(value, owner_shard);
+		} else {
+			value->release();
+		}
+	}
+
+	std::uintptr_t bits_ = 0;
+};
+
+static_assert(sizeof(ValueLoan) == 8);
 
 inline CacheValuePtr CacheValuePtr::share(CacheValue *p) noexcept {
 	if (p)

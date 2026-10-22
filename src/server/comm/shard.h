@@ -83,6 +83,16 @@ public:
 		system_->inbox(shard_id).mailbox.push(envelope);
 	}
 
+	// 不急着处理的信封（只带归还记录）：入队，只在别的消息可能卡在它后面时才敲门（见 MpscQueue::push_quiet）。
+	// 返回是否写了 eventfd。
+	bool push_quiet(const std::size_t shard_id, Envelope *envelope) const noexcept {
+		Inbox &inbox = system_->inbox(shard_id);
+		if (!inbox.mailbox.push_quiet(envelope)) {
+			return false;
+		}
+		return inbox.doorbell.knock(); // push_quiet 已经做过 fence
+	}
+
 	[[nodiscard]] inline std::size_t get_shard(const uint64_t hash) const {
 		return util::get_shard(hash, shard_num_);
 	}
