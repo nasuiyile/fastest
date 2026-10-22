@@ -171,7 +171,7 @@ struct QuitResponse {
 enum class ResponseErrorKind : std::uint8_t { Error, ClientError, ServerError };
 
 // message 只能指向静态存储期的字符串（字面量）：错误响应会跨分片、在环形数组里等待，并被 GatherSink 直接引用。
-// 用 string_view 而不是 std::string，不需要堆分配，RequestMessage 也因此从 112 字节降到 96 字节。
+// 用 string_view 而不是 std::string，不需要堆分配，跨分片的请求条目（HopEntry）也因此小 16 字节。
 struct ErrorResponse {
 	static constexpr ResponseType response_type = ResponseType::Error;
 	ResponseErrorKind kind = ResponseErrorKind::Error;

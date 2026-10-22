@@ -1374,7 +1374,97 @@ void drain_eventfd(const int fd) {
 	uint64_t value = 0;
 	REQUIRE(::read(fd, &value, sizeof(value)) == sizeof(value));
 }
+
+struct TestNode : MpscHook {
+	TestNode(const uint32_t p, const uint64_t v) : producer(p), value(v) {
+	}
+
+	uint32_t producer;
+	uint64_t value;
+};
 } // namespace
+
+TEST_CASE("MpscQueue pops in push order and hands back each node once", "[mailbox]") {
+	MpscQueue<TestNode> queue;
+	REQUIRE(queue.pop() == nullptr);
+	queue.push(new TestNode(0, 1));
+	TestNode *node = queue.pop(); // 只有一个节点：要先把占位节点挂到它后面才能取走
+	REQUIRE(node != nullptr);
+	REQUIRE(node->value == 1);
+	delete node;
+	REQUIRE(queue.pop() == nullptr);
+	for (uint64_t i = 0; i != 5; ++i) {
+		queue.push(new TestNode(0, i));
+	}
+	for (uint64_t i = 0; i != 3; ++i) {
+		node = queue.pop();
+		REQUIRE(node != nullptr);
+		REQUIRE(node->value == i);
+		delete node;
+	}
+	queue.push(new TestNode(0, 5));
+	for (uint64_t i = 3; i != 6; ++i) {
+		node = queue.pop();
+		REQUIRE(node != nullptr);
+		REQUIRE(node->value == i);
+		delete node;
+	}
+	REQUIRE(queue.pop() == nullptr);
+	queue.push(new TestNode(0, 6)); // 留在队列里：析构时释放（ASan 检查泄漏）
+}
+
+TEST_CASE("an envelope constructs, converts and destroys its entries in place", "[mailbox]") {
+	const std::string long_key(40, 'k'); // 超过 SSO：key 在堆上，泄漏或重复释放会被 ASan 发现
+	auto *envelope = new Envelope;
+	envelope->reset(0, 1);
+	for (uint32_t i = 0; i != Envelope::kCapacity; ++i) {
+		REQUIRE_FALSE(envelope->full());
+		envelope->append(7, i, RequestData {SingleKeyRequest {SingleKeyCommand(SingleGetCommand {ItemKey(long_key)})}});
+	}
+	REQUIRE(envelope->full());
+	REQUIRE(envelope->size() == Envelope::kCapacity);
+	REQUIRE((*envelope)[3].seq == 3);
+	// 执行端原地换成响应：一半换，一半保持请求，析构时两种都要正确释放。
+	for (std::size_t i = 0; i != Envelope::kCapacity / 2; ++i) {
+		(*envelope)[i].data.emplace<ResponseData>(ErrorResponse {});
+	}
+	envelope->clear();
+	REQUIRE(envelope->size() == 0);
+	envelope->reset(1, 0);
+	envelope->append(8, 0, RequestData {SingleKeyRequest {SingleKeyCommand(SingleGetCommand {ItemKey(long_key)})}});
+	delete envelope; // 析构释放剩下的条目
+}
+
+TEST_CASE("a batch sends one envelope per target shard and splits only when it is full", "[mailbox]") {
+	WorkerFixture f;
+	Worker &local = f.workers[0];
+	Worker &remote = f.workers[1];
+	const auto key = shard_key(1);
+	{
+		Worker::BatchScope scope(local);
+		for (int i = 0; i != 10; ++i) {
+			f.queue_get(key);
+		}
+		REQUIRE(local.envelopes_sent() == 0); // 批次结束前不发
+	}
+	REQUIRE(local.envelopes_sent() == 1); // 10 条装一个信封
+	{
+		Worker::BatchScope scope(local);
+		for (int i = 0; i != 2 * Envelope::kCapacity + 3; ++i) {
+			f.queue_get(key);
+		}
+		REQUIRE(local.envelopes_sent() == 3); // 装满的两个先发出去
+	}
+	REQUIRE(local.envelopes_sent() == 4);
+	f.start_mailboxes();
+	std::string expected;
+	for (int i = 0; i != 10 + 2 * Envelope::kCapacity + 3; ++i) {
+		expected += "END\r\n";
+	}
+	REQUIRE(f.read(expected.size()) == expected); // 跨信封仍按序
+	REQUIRE(remote.envelopes_sent() == 4); // 原信封带着响应推回，不另外打包
+	REQUIRE(remote.mailbox_messages() == 10 + 2 * Envelope::kCapacity + 3);
+}
 
 TEST_CASE("a doorbell writes its eventfd once until the consumer lowers it", "[doorbell]") {
 	Doorbell bell;
@@ -1411,10 +1501,8 @@ TEST_CASE("concurrent producers never lose a doorbell wakeup", "[doorbell]") {
 	constexpr uint64_t kPerProducer = 100000;
 	constexpr uint64_t kTotal = kProducers * kPerProducer;
 	Doorbell bell;
-	Mailbox<uint64_t> requests;
-	Mailbox<uint64_t> responses;
+	MpscQueue<TestNode> queue;
 	std::atomic<uint64_t> knocks {0};
-	std::atomic<bool> push_failed {false};
 
 	std::vector<std::thread> producers;
 	for (int p = 0; p < kProducers; ++p) {
@@ -1425,10 +1513,7 @@ TEST_CASE("concurrent producers never lose a doorbell wakeup", "[doorbell]") {
 			while (sent < kPerProducer) {
 				const uint64_t batch = std::min<uint64_t>(1 + rng() % 8, kPerProducer - sent);
 				for (uint64_t i = 0; i < batch; ++i, ++sent) {
-					auto message = std::make_unique<uint64_t>(sent);
-					if (!((sent & 1) != 0 ? requests : responses).try_push(message)) {
-						push_failed = true;
-					}
+					queue.push(new TestNode(static_cast<uint32_t>(p), sent));
 				}
 				local_knocks += bell.ring();
 				for (unsigned spin = rng() % 16384; spin != 0; --spin) {
@@ -1445,13 +1530,14 @@ TEST_CASE("concurrent producers never lose a doorbell wakeup", "[doorbell]") {
 	uint64_t lowers = 0;
 	uint64_t sleeps = 0;
 	bool lost_wakeup = false;
+	bool out_of_order = false;
+	std::array<uint64_t, kProducers> next_value {};
 	const auto drain = [&] {
 		std::size_t n = 0;
-		std::unique_ptr<uint64_t> message;
-		while (requests.pop(message)) {
-			++n;
-		}
-		while (responses.pop(message)) {
+		while (TestNode *node = queue.pop()) {
+			// 同一个生产者的节点必须按 push 顺序取出（分片间请求的顺序保证依赖这一点）。
+			out_of_order |= node->value != next_value[node->producer]++;
+			delete node;
 			++n;
 		}
 		received += n;
@@ -1479,8 +1565,8 @@ TEST_CASE("concurrent producers never lose a doorbell wakeup", "[doorbell]") {
 		producer.join();
 	}
 	::close(fd);
-	REQUIRE_FALSE(push_failed);
 	REQUIRE_FALSE(lost_wakeup);
+	REQUIRE_FALSE(out_of_order);
 	REQUIRE(received == kTotal);
 	// 每次放下门铃（加上初始的放下状态）最多换来一次 eventfd 写入。
 	REQUIRE(knocks.load() <= lowers + 1);
@@ -1494,7 +1580,7 @@ TEST_CASE("a producer that waits for every reply wakes the sleeping consumer eve
 	// 反复穿过最容易丢唤醒的窗口。丢一次就会卡住，poll 超时。
 	constexpr uint64_t kRoundTrips = 20000;
 	Doorbell bell;
-	Mailbox<uint64_t> requests;
+	MpscQueue<TestNode> queue;
 	std::atomic<uint64_t> received {0};
 	std::atomic<bool> lost_wakeup {false};
 	uint64_t knocks = 0;
@@ -1503,8 +1589,8 @@ TEST_CASE("a producer that waits for every reply wakes the sleeping consumer eve
 		uint64_t local = 0;
 		const auto drain = [&] {
 			std::size_t n = 0;
-			std::unique_ptr<uint64_t> message;
-			while (requests.pop(message)) {
+			while (TestNode *node = queue.pop()) {
+				delete node;
 				++n;
 			}
 			local += n;
@@ -1531,8 +1617,7 @@ TEST_CASE("a producer that waits for every reply wakes the sleeping consumer eve
 		::close(fd);
 	});
 	for (uint64_t i = 0; i < kRoundTrips && !lost_wakeup; ++i) {
-		auto message = std::make_unique<uint64_t>(i);
-		REQUIRE(requests.try_push(message));
+		queue.push(new TestNode(0, i));
 		knocks += bell.ring();
 		while (received.load(std::memory_order_acquire) <= i && !lost_wakeup) {
 		}
@@ -1569,8 +1654,8 @@ TEST_CASE("a batch rings each remote shard once and flushes every 64 messages", 
 		for (int i = 0; i != 63; ++i) {
 			f.queue_get(remote);
 		}
-		REQUIRE(w.doorbell_knocks() == 1);
-		f.queue_get(remote); // 第 64 条：先把攒下的敲出去，不等作用域结束
+		REQUIRE(w.doorbell_knocks() == 1); // 装满的 3 个信封（48 条）已发出，还不到 64 条
+		f.queue_get(remote); // 第 64 条装满第 4 个信封：已发出 64 条，先把攒下的敲出去，不等作用域结束
 		REQUIRE(w.doorbell_knocks() == 2);
 		drain_eventfd(fd);
 		remote_bell.lower();
@@ -1590,7 +1675,7 @@ TEST_CASE("a batch rings each remote shard once and flushes every 64 messages", 
 	REQUIRE_FALSE(doorbell_pending(fd));
 	::close(fd);
 
-	// 一共 10 + 65 + 2 条请求都在对端 mailbox 里：交给收件协程，响应全部按序到达。
+	// 一共 10 + 65 + 2 条请求都在对端收件队列里：交给收件协程，响应全部按序到达。
 	f.start_mailboxes();
 	std::string expected;
 	for (int i = 0; i != 77; ++i) {

@@ -1,32 +1,22 @@
 #pragma once
 #include <boost/asio/detail/config.hpp> // BOOST_ASIO_HAS_IO_URING_AS_DEFAULT
-#include <boost/lockfree/mpsc_weak_queue.hpp>
 
 #include <sys/eventfd.h>
 #include <atomic>
 #include <cerrno>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <fcntl.h>
-#include <memory>
 #include <system_error>
-#include <type_traits>
 #include <unistd.h>
-
-// 事件只持有指向消息的指针，因此与消息类型无关存储布局
-template <typename Message>
-struct ShardEvent {
-	Message *message {nullptr};
-};
-
-constexpr std::size_t kMailboxCapacity = 1024;
 
 namespace fastest {
 // 相邻行预取器按 128B 成对拉取缓存行，门铃标志独占一对，避免和队列的 head/tail 伪共享。
 inline constexpr std::size_t kCacheLinePair = 128;
 
 /*
- * 门铃：每个分片一个，请求、响应两个 mailbox 共用（一个 eventfd + 一个标志）。
+ * 门铃：每个分片一个，配合分片的收件队列（MpscQueue）使用（一个 eventfd + 一个标志）。
  *
  * rung_ 为 true 表示门铃已抬起，生产者 push 之后不必写 eventfd，因为下面两种情况必居其一：
  *   - 有人敲过门，eventfd 里有计数，消费者会醒；
@@ -37,7 +27,7 @@ inline constexpr std::size_t kCacheLinePair = 128;
  * 两个 seq_cst fence 总有先后：生产者的在前，消费者的复查一定能看到这条消息；消费者的在前，生产者读到的
  * 要么是 false（自己去敲门），要么是这次放下之后别人写的 true：敲门者写的，它会敲门；消费者 raise() 写的，
  * 消费者醒着，睡前还会再放下、再复查一次。
- * Vyukov 队列的 push 分两步（交换尾指针 → 链接前驱），另一个生产者卡在两步之间时 pop 会提前返回 false，
+ * Vyukov 队列的 push 分两步（交换尾指针 → 链接前驱），另一个生产者卡在两步之间时 pop 会提前返回空，
  * 排在它后面的消息暂时取不到；卡住的生产者链接完成后同样会执行上面的检查，所以也不会丢。
  */
 class alignas(kCacheLinePair) Doorbell {
@@ -158,54 +148,79 @@ private:
 	int event_fd_ {-1};
 };
 
-// MPSC 队列；唤醒由分片共用的 Doorbell 负责，push 不写 eventfd。
-template <typename Message>
-class alignas(64) Mailbox {
-	static_assert(std::is_trivially_copyable_v<ShardEvent<Message>>, "ShardEvent must be trivially copyable");
-	using MailboxQueue = boost::lockfree::mpsc_weak_queue<ShardEvent<Message>>;
+// 侵入式 MPSC 队列的链接钩子：节点类型继承它，队列只操作钩子，不分配内存。
+struct MpscHook {
+	std::atomic<MpscHook *> next {nullptr};
+};
 
+/*
+ * 侵入式 Vyukov MPSC 队列：多个生产者，一个消费者（队列所属的分片线程）。
+ * push = 一次 exchange 加一次 release store，没有分配、没有 freelist、没有 CAS 重试；唤醒由分片的 Doorbell 负责。
+ * 生产者竞争的 tail_ 和消费者独占的 head_ 各占一对缓存行。
+ * push 分两步（交换尾指针 → 链接前驱）：另一个生产者卡在两步之间时 pop 会提前返回 nullptr，排在它后面的节点暂时取不到，
+ * 卡住的生产者链接完成后照常敲门，所以不会丢（见 Doorbell）。
+ * pop 返回的节点之后不会再被生产者写 next，消费者可以立刻把它推进别的队列。
+ * 析构时 delete 残留节点（只在 shutdown 时发生）。
+ */
+template <typename Node>
+	requires std::derived_from<Node, MpscHook>
+class MpscQueue {
 public:
-	Mailbox() : queue_(kMailboxCapacity) {
+	MpscQueue() noexcept : tail_(&stub_), head_(&stub_) {
 	}
 
-	~Mailbox() {
-		// 释放残留消息，避免 shutdown 时泄漏。
-		ShardEvent<Message> ev {};
-		while (queue_.pop(ev)) {
-			delete ev.message;
-			ev.message = nullptr;
+	~MpscQueue() {
+		while (Node *node = pop()) {
+			delete node;
 		}
 	}
 
-	Mailbox(const Mailbox &) = delete;
-	Mailbox &operator=(const Mailbox &) = delete;
+	MpscQueue(const MpscQueue &) = delete;
+	MpscQueue &operator=(const MpscQueue &) = delete;
 
-	// 成功时 queue 取得所有权。调用方负责在之后敲目标分片的门铃。
-	bool try_push(std::unique_ptr<Message> &message) {
-		if (!message) {
-			return false;
-		}
-		ShardEvent<Message> ev {};
-		ev.message = message.get();
-		if (!queue_.push(ev)) {
-			return false;
-		}
-		// queue 已经拥有 message。释放对message的所有权 防止delete
-		message.release();
-		return true;
+	// 任意线程；调用方负责之后敲目标分片的门铃。
+	void push(Node *node) noexcept {
+		link(node);
 	}
 
-	// consumer 取得 ownership。
-	bool pop(std::unique_ptr<Message> &out) {
-		ShardEvent<Message> ev {};
-		if (!queue_.pop(ev)) {
-			return false;
+	// 只有消费者调用。队列为空，或者唯一的后继还没被生产者链接上时，返回 nullptr。
+	Node *pop() noexcept {
+		MpscHook *head = head_;
+		MpscHook *next = head->next.load(std::memory_order_acquire);
+		if (head == &stub_) {
+			if (next == nullptr) {
+				return nullptr;
+			}
+			head_ = next;
+			head = next;
+			next = next->next.load(std::memory_order_acquire);
 		}
-		out.reset(ev.message);
-		return true;
+		if (next != nullptr) {
+			head_ = next;
+			return static_cast<Node *>(head);
+		}
+		if (head != tail_.load(std::memory_order_acquire)) {
+			return nullptr; // 有生产者交换了尾指针、还没链接
+		}
+		// head 是最后一个节点：把 stub 挂到它后面，才能把它取走。
+		link(&stub_);
+		next = head->next.load(std::memory_order_acquire);
+		if (next != nullptr) {
+			head_ = next;
+			return static_cast<Node *>(head);
+		}
+		return nullptr;
 	}
 
 private:
-	MailboxQueue queue_;
+	void link(MpscHook *node) noexcept {
+		node->next.store(nullptr, std::memory_order_relaxed);
+		MpscHook *prev = tail_.exchange(node, std::memory_order_acq_rel);
+		prev->next.store(node, std::memory_order_release);
+	}
+
+	alignas(kCacheLinePair) std::atomic<MpscHook *> tail_; // 生产者 exchange
+	alignas(kCacheLinePair) MpscHook *head_;               // 只有消费者读写
+	MpscHook stub_;                                         // 队列空时的占位节点
 };
 } // namespace fastest

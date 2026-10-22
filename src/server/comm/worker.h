@@ -84,9 +84,14 @@ struct WorkerStats {
 	uint64_t mailbox_messages{0}; // 收件协程处理的消息数
 	uint64_t mailbox_sleeps{0};   // 收件协程在 fd 上睡下的次数
 	uint64_t socket_writes{0};    // 发起的 async_write 次数
+	uint64_t envelopes_sent{0};   // 推进别的分片收件队列的信封数（去程和回程）
 
 	void knocked(const bool wrote) noexcept {
 		doorbell_knocks += wrote;
+	}
+
+	void sent_envelope() noexcept {
+		++envelopes_sent;
 	}
 
 	void wrote() noexcept {
@@ -104,6 +109,9 @@ struct WorkerStats {
 	void knocked(bool) noexcept {
 	}
 
+	void sent_envelope() noexcept {
+	}
+
 	void wrote() noexcept {
 	}
 
@@ -118,23 +126,40 @@ struct WorkerStats {
 class Worker {
 public:
 	std::unordered_map<uint64_t, std::unique_ptr<TCPSession> > tcp_session_;
-	using Sc = ShardComm<RequestMessage, ResponseMessage>;
+	using Sc = ShardComm;
 
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
 		: shard_comm_(std::move(shard_comm)), data_(static_cast<uint16_t>(shard_comm_.current_shard_id())),
 		  multi_key_index_(shard_comm_.shard_num()), stop_(std::move(stop)),
-		  doorbell_pending_mark_(shard_comm_.shard_num(), 0) {
+		  doorbell_pending_mark_(shard_comm_.shard_num(), 0), open_envelopes_(shard_comm_.shard_num(), nullptr) {
 		doorbell_pending_.reserve(shard_comm_.shard_num());
+		open_targets_.reserve(shard_comm_.shard_num());
+		envelope_pool_.reserve(kEnvelopePoolMax);
 	}
 
+	// 批次之间不会有打开的信封；在途的信封留在各分片的收件队列里，由队列析构释放。
+	~Worker() {
+		for (Envelope *envelope : open_envelopes_) {
+			delete envelope;
+		}
+		for (Envelope *envelope : envelope_pool_) {
+			delete envelope;
+		}
+	}
+
+	Worker(const Worker &) = delete;
+	Worker &operator=(const Worker &) = delete;
+
 	/*
-	 * 批次作用域：合并敲门和写。
-	 * 作用域内发出的请求/响应只入队、记下目标分片；响应入环只记下连接，不发起写。离开作用域时先给每个目标分片敲一次门铃
-	 * （让对端尽早开始处理），再给每个连接 kick_write 一次，一次写带上这一批里该连接所有就绪的响应。
-	 * 一个作用域里攒到 kDoorbellFlushEvery 条消息也先敲一次门铃，避免对端在睡、长时间听不到。
-	 * 作用域内不能 co_await：挂起前必须把门铃敲出去、把写发起，否则对端可能一直睡着，响应也一直不发。
+	 * 批次作用域：合并跨分片投递、敲门和写。
+	 * 作用域内发往别的分片的请求装进每个目标分片一个的信封（装满 Envelope::kCapacity 条就先发出去）；
+	 * 响应入环只记下连接，不发起写。离开作用域时先把还开着的信封发出去、每个目标分片敲一次门铃（让对端尽早开始处理），
+	 * 再给每个连接 kick_write 一次，一次写带上这一批里该连接所有就绪的响应。
+	 * 一个作用域里已发出的消息攒到 kDoorbellFlushEvery 条也先敲一次门铃，避免对端在睡、长时间听不到。
+	 * 作用域内不能 co_await：挂起前必须把信封发出去、门铃敲出去、写发起，否则对端收不到请求，响应也一直不发。
 	 * 所有跨分片发送和响应入环都必须在作用域内：解析批次（Handler::session）和收件协程的一轮（drain_inbox）。
-	 * 作用域外发出的消息没人敲门，入环的响应要等下一个作用域结束才写。嵌套时内层退出也会敲门、发起写，只是提前，不影响正确性。
+	 * 作用域外装进信封的请求要等下一个作用域结束才发出，入环的响应要等下一个作用域结束才写。
+	 * 嵌套时内层退出也会发出信封、敲门、发起写，只是提前，不影响正确性。
 	 */
 	class BatchScope {
 	public:
@@ -142,7 +167,7 @@ public:
 		}
 
 		~BatchScope() {
-			worker_.ring_doorbells();
+			worker_.flush_outbound();
 			worker_.kick_dirty_sessions();
 		}
 
@@ -155,10 +180,10 @@ public:
 	};
 
 	/*
-	 * 本分片唯一的收件协程：请求、响应两个 mailbox 共用一个门铃。
+	 * 本分片唯一的收件协程：一个收件队列（请求信封和回程信封都在里面）加一个门铃。
 	 *
-	 * 醒着时门铃保持抬起，生产者 push 后只读一下标志就返回，不写 eventfd。每轮把两个 mailbox 都清空（不设上限），
-	 * 这一轮处理过消息就让出 CPU 给 socket，稍后再来一轮；某一轮两个 mailbox 都是空的，才放下门铃、
+	 * 醒着时门铃保持抬起，生产者 push 后只读一下标志就返回，不写 eventfd。每轮把收件队列清空（不设上限），
+	 * 这一轮处理过消息就让出 CPU 给 socket，稍后再来一轮；某一轮收件队列是空的，才放下门铃、
 	 * fence 后再查一遍，确实为空才去等 fd。所以有流量时几乎不写 eventfd，只有从空闲转忙时敲一次门。
 	 *
 	 * 从不等 socket：响应只入环形数组，一轮结束时每个连接发起一次写，写被阻塞的连接不影响其他连接和请求。
@@ -233,6 +258,10 @@ public:
 		return stats_.socket_writes;
 	}
 
+	[[nodiscard]] uint64_t envelopes_sent() const noexcept {
+		return stats_.envelopes_sent;
+	}
+
 	[[nodiscard]] Doorbell &doorbell(const std::size_t shard) const noexcept {
 		return shard_comm_.doorbell(shard);
 	}
@@ -305,11 +334,7 @@ public:
 			                                        .data = ResponseData{std::move(response)}});
 			return;
 		}
-		RequestMessage request_message = {.tcp_id = tcp_id,
-		                                  .seq = seq,
-		                                  .shard_id = static_cast<uint16_t>(current_shard_id()),
-		                                  .data = RequestData{SingleKeyRequest{std::move(command)}}};
-		post_request(shard, std::move(request_message));
+		post_request(shard, tcp_id, seq, RequestData{SingleKeyRequest{std::move(command)}});
 	}
 
 	// 过大value 需要把同名值删掉，否则旧数据会一直留着。
@@ -327,17 +352,13 @@ public:
 		if (rejected_set_key) {
 			const std::size_t shard = shard_comm_.get_shard(rejected_set_key->hash);
 			if (!shard_comm_.is_current_shard(shard)) {
-				RequestMessage request{.tcp_id = tcp_id,
-				                       .seq = seq,
-				                       .shard_id = static_cast<uint16_t>(current_shard_id()),
-				                       .data = RejectedSetRequest{std::move(*rejected_set_key), std::move(response)}};
-				post_request(shard, std::move(request));
+				post_request(shard, tcp_id, seq,
+				             RequestData{RejectedSetRequest{std::move(*rejected_set_key), std::move(response)}});
 				return;
 			}
 			data_.erase_rejected_set(*rejected_set_key);
 		}
-		// Errors use the same ordered response path, without a mailbox hop or
-		// a heap-allocated message on the connection's owning shard.
+		// 错误走同一条有序响应路径，在连接所属分片上直接入环，不经过信封。
 		handle_response_message(ResponseMessage{.tcp_id = tcp_id,
 		                                        .seq = seq,
 		                                        .shard_id = static_cast<uint16_t>(current_shard_id()),
@@ -363,10 +384,10 @@ public:
 	}
 
 private:
-	void handle_request_message(const std::unique_ptr<RequestMessage> &message) {
-		auto &cmd = message->data;
-		ResponseData res = std::visit(
-			[&, this](auto &c) -> ResponseData {
+	// 执行一条别的分片发来的请求，返回它的响应。请求里的数据会被移走。
+	ResponseData execute_request(RequestData &request) {
+		return std::visit(
+			[this](auto &c) -> ResponseData {
 				using T = std::decay_t<decltype(c)>;
 				if constexpr (std::is_same_v<T, SingleKeyRequest>) {
 					return data_.handle_single_command(std::move(c.command));
@@ -378,13 +399,53 @@ private:
 					return std::move(c.response);
 				}
 			},
-			cmd);
-		// 响应发回请求的发送方；响应里的 shard_id 填自己（响应的发送方）
-		ResponseMessage response_message = {.tcp_id = message->tcp_id,
-		                                    .seq = message->seq,
-		                                    .shard_id = static_cast<uint16_t>(shard_comm_.current_shard_id()),
-		                                    .data = std::move(res)};
-		post_response(message->shard_id, std::move(response_message));
+			request);
+	}
+
+	// 别的分片发来的信封：逐条执行，响应原地写回同一个位置，然后把信封推回发起分片。
+	void execute_envelope(Envelope &envelope) {
+		for (std::size_t i = 0; i < envelope.size(); ++i) {
+			HopEntry &entry = envelope[i];
+			try {
+				ResponseData response = execute_request(std::get<RequestData>(entry.data));
+				entry.data.emplace<ResponseData>(std::move(response));
+			} catch (const std::bad_alloc &) {
+				spdlog::error("[shard {}] request failed: out of memory", current_shard_id());
+				fail_entry(entry, "out of memory");
+			} catch (const std::exception &e) {
+				spdlog::error("[shard {}] request failed: {}", current_shard_id(), e.what());
+				fail_entry(entry, "internal error");
+			} catch (...) {
+				spdlog::error("[shard {}] request failed: unknown exception", current_shard_id());
+				fail_entry(entry, "internal error");
+			}
+		}
+		envelope.mark_returned();
+		send_envelope(envelope.origin(), &envelope);
+	}
+
+	// 每条请求都必须有回复，否则连接的有序响应会一直等这个序号；message 必须是字面量。
+	static void fail_entry(HopEntry &entry, const std::string_view message) noexcept {
+		entry.data.emplace<ResponseData>(ErrorResponse{.kind = ResponseErrorKind::ServerError, .message = message});
+	}
+
+	// 自己发出去、带着响应回来的信封：响应放进各连接的环形数组（只入环，批次结束统一发起写），然后信封放回池里。
+	void receive_envelope(Envelope &envelope) noexcept {
+		const uint16_t from = envelope.target();
+		for (std::size_t i = 0; i < envelope.size(); ++i) {
+			HopEntry &entry = envelope[i];
+			try {
+				handle_response_message(ResponseMessage{.tcp_id = entry.tcp_id,
+				                                        .seq = entry.seq,
+				                                        .shard_id = from,
+				                                        .data = std::move(std::get<ResponseData>(entry.data))});
+			} catch (const std::exception &e) {
+				spdlog::error("[shard {}] response handler exception: {}", current_shard_id(), e.what());
+			} catch (...) {
+				spdlog::error("[shard {}] response handler unknown exception", current_shard_id());
+			}
+		}
+		release_envelope(&envelope);
 	}
 
 	// count 是这条多 key 请求一共拆成了几个分片。
@@ -401,36 +462,73 @@ private:
 				.data = ResponseData{ShardResponse{.count = count, .command = std::move(response)}}});
 			return;
 		}
-		RequestMessage request_message = {
-			.tcp_id = tcp_id,
-			.seq = seq,
-			.shard_id = static_cast<uint16_t>(current_shard_id()),
-			.data = RequestData{MultiKeyRequest{.count = count, .command = std::move(command)}}};
-		post_request(shard, std::move(request_message));
+		post_request(shard, tcp_id, seq, RequestData{MultiKeyRequest{.count = count, .command = std::move(command)}});
 	}
 
-	// ---- 门铃 ----
-	// 一个作用域里攒到这么多条消息就先敲一次已攒下的门铃，不中断消费，只限制对端听到门铃前的延迟。
+	// ---- 信封与门铃 ----
+	// 一个作用域里已发出的消息攒到这么多条就先敲一次已攒下的门铃，不中断消费，只限制对端听到门铃前的延迟。
 	static constexpr uint32_t kDoorbellFlushEvery = 64;
+	// 每个 Worker 最多留这么多个空信封复用（约 110KB），多出来的直接释放；释放和分配都在本线程。
+	static constexpr std::size_t kEnvelopePoolMax = 64;
 
-	void post_request(const std::size_t shard, RequestMessage &&message) {
-		shard_comm_.push_request(shard, std::make_unique<RequestMessage>(std::move(message)));
-		note_doorbell(shard);
+	// 装进发往 shard 的信封；装满就先发出去，其余的等批次结束（BatchScope）一起发。
+	void post_request(const std::size_t shard, const uint64_t tcp_id, const uint32_t seq, RequestData &&request) {
+		Envelope *&envelope = open_envelopes_[shard];
+		if (envelope == nullptr) {
+			// 先记分片再取信封：取信封抛异常时只留下一个空位，flush 时跳过。同一分片装满后再打开会重复记，同样跳过。
+			open_targets_.push_back(static_cast<uint16_t>(shard));
+			envelope = acquire_envelope(static_cast<uint16_t>(shard));
+		}
+		envelope->append(tcp_id, seq, std::move(request));
+		if (envelope->full()) {
+			send_envelope(shard, std::exchange(envelope, nullptr));
+		}
 	}
 
-	void post_response(const std::size_t shard, ResponseMessage &&message) {
-		shard_comm_.push_response(shard, std::make_unique<ResponseMessage>(std::move(message)));
-		note_doorbell(shard);
+	// 批次结束：把还开着的信封都发出去，然后每个目标分片敲一次门铃。
+	void flush_outbound() noexcept {
+		for (const uint16_t shard : open_targets_) {
+			if (Envelope *envelope = std::exchange(open_envelopes_[shard], nullptr)) {
+				send_envelope(shard, envelope);
+			}
+		}
+		open_targets_.clear();
+		ring_doorbells();
 	}
 
-	// 只记下目标分片，由 BatchScope 退出时（或攒满 kDoorbellFlushEvery 条时）统一敲门。
-	void note_doorbell(const std::size_t shard) {
+	// 推进目标分片的收件队列（去程或回程），记下门铃，由 BatchScope 退出时（或攒满 kDoorbellFlushEvery 条时）统一敲门。
+	void send_envelope(const std::size_t shard, Envelope *envelope) noexcept {
+		const uint16_t messages = envelope->size();
+		shard_comm_.push(shard, envelope);
+		stats_.sent_envelope();
 		if (!doorbell_pending_mark_[shard]) {
 			doorbell_pending_mark_[shard] = 1;
 			doorbell_pending_.push_back(static_cast<uint16_t>(shard)); // 预留了 shard_num 个，不会扩容
 		}
-		if (++doorbell_pending_messages_ >= kDoorbellFlushEvery) {
+		doorbell_pending_messages_ += messages;
+		if (doorbell_pending_messages_ >= kDoorbellFlushEvery) {
 			ring_doorbells();
+		}
+	}
+
+	Envelope *acquire_envelope(const uint16_t target) {
+		Envelope *envelope;
+		if (envelope_pool_.empty()) {
+			envelope = new Envelope;
+		} else {
+			envelope = envelope_pool_.back();
+			envelope_pool_.pop_back();
+		}
+		envelope->reset(static_cast<uint16_t>(current_shard_id()), target);
+		return envelope;
+	}
+
+	void release_envelope(Envelope *envelope) noexcept {
+		envelope->clear();
+		if (envelope_pool_.size() < kEnvelopePoolMax) {
+			envelope_pool_.push_back(envelope); // 预留了 kEnvelopePoolMax 个，不会扩容
+		} else {
+			delete envelope;
 		}
 	}
 
@@ -448,53 +546,23 @@ private:
 		doorbell_pending_.clear();
 	}
 
-	// 一轮：先清请求并把响应的门铃敲出去，再清响应（只入环）；响应处理期间又来了请求就立刻再清一遍，
-	// 不让别的分片发来的请求排到本线程所有 socket 后面。一轮结束时（BatchScope 析构）才统一发起写。返回处理的消息数。
+	// 一轮：按到达顺序取空收件队列（不设上限）。别人的请求信封执行完立刻推回发起分片；
+	// 遇到自己的回程信封时，先把已推回信封的门铃敲出去，再把响应放进环形数组，不让发起分片等本线程处理响应。
+	// 写在一轮结束时（BatchScope 析构）统一发起。返回处理的消息数。
 	std::size_t drain_inbox() {
-		auto &inbox = shard_comm_.current_inbox();
+		auto &mailbox = shard_comm_.current_inbox().mailbox;
 		BatchScope batch(*this);
-		std::size_t handled = drain_requests(inbox.requests);
-		ring_doorbells();
-		const std::size_t responses = drain_responses(inbox.responses);
-		handled += responses;
-		if (responses != 0) {
-			handled += drain_requests(inbox.requests);
+		std::size_t handled = 0;
+		while (Envelope *envelope = mailbox.pop()) {
+			handled += envelope->size();
+			if (!envelope->returned()) {
+				execute_envelope(*envelope);
+				continue;
+			}
+			ring_doorbells();
+			receive_envelope(*envelope);
 		}
 		stats_.handled(handled);
-		return handled;
-	}
-
-	std::size_t drain_requests(Mailbox<RequestMessage> &mailbox) {
-		std::size_t handled = 0;
-		std::unique_ptr<RequestMessage> message;
-		while (mailbox.pop(message)) {
-			++handled;
-			try {
-				handle_request_message(message);
-			} catch (const std::exception &e) {
-				spdlog::error("[shard {}] mailbox handler exception: {}", current_shard_id(), e.what());
-			} catch (...) {
-				spdlog::error("[shard {}] mailbox handler unknown exception", current_shard_id());
-			}
-			message.reset();
-		}
-		return handled;
-	}
-
-	std::size_t drain_responses(Mailbox<ResponseMessage> &mailbox) {
-		std::size_t handled = 0;
-		std::unique_ptr<ResponseMessage> message;
-		while (mailbox.pop(message)) {
-			++handled;
-			try {
-				handle_response_message(std::move(*message)); // 只入环，一轮结束时统一发起写
-			} catch (const std::exception &e) {
-				spdlog::error("[shard {}] mailbox handler exception: {}", current_shard_id(), e.what());
-			} catch (...) {
-				spdlog::error("[shard {}] mailbox handler unknown exception", current_shard_id());
-			}
-			message.reset();
-		}
 		return handled;
 	}
 
@@ -682,6 +750,11 @@ private:
 	uint64_t doorbell_count_{0}; // 只在io_uring下使用io_uring：async_read 门铃的目标
 	// 本批入过环、等批次结束统一 kick_write 的连接（会话的 kick_pending 去重）。只由本线程访问；批次之间总是空的。
 	std::vector<std::pair<uint64_t, TCPSession *> > dirty_sessions_;
+	// 发往各分片、还没发出的信封（按分片编号索引，没有时为 nullptr）和这一批打开过信封的分片。只由本线程访问；批次之间总是空的。
+	std::vector<Envelope *> open_envelopes_;
+	std::vector<uint16_t> open_targets_;
+	// 用完的空信封，下次直接取出，不再分配；最多留 kEnvelopePoolMax 个。
+	std::vector<Envelope *> envelope_pool_;
 
 	// 统计计数，只在测试构建里存在。
 	[[no_unique_address]] WorkerStats stats_;

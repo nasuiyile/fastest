@@ -11,7 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # =========================
 # Dependencies
 # =========================
-find_package(Boost CONFIG REQUIRED COMPONENTS asio intrusive system lockfree)
+find_package(Boost CONFIG REQUIRED COMPONENTS asio intrusive system)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Catch2 3 REQUIRED)
 find_package(mimalloc REQUIRED)
@@ -26,6 +26,7 @@ add_executable(fastest
         src/server/comm/input_buffer.h
         src/server/comm/ring_array.h
         src/server/comm/mailbox.h
+        src/server/comm/envelope.h
         src/server/comm/worker.h
         src/server/comm/shard.h
         src/server/comm/shard.h
@@ -48,7 +49,6 @@ target_link_libraries(fastest
         Boost::asio
         Boost::intrusive
         Boost::system
-        Boost::lockfree
         spdlog::spdlog
         mimalloc
 )
@@ -85,7 +85,7 @@ target_include_directories(fastest_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE
 # 打开只在测试里需要的统计计数和门铃访问接口（Worker 的 WorkerStats）。
 target_compile_definitions(fastest_protocol_tests PRIVATE FASTEST_TESTING)
 target_link_libraries(fastest_protocol_tests PRIVATE
-        Boost::asio Boost::intrusive Boost::system Boost::lockfree spdlog::spdlog Catch2::Catch2WithMain)
+        Boost::asio Boost::intrusive Boost::system spdlog::spdlog Catch2::Catch2WithMain)
 add_test(NAME fastest_protocol_tests COMMAND fastest_protocol_tests)
 
 

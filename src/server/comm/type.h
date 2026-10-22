@@ -26,7 +26,7 @@ struct ShardResponse {
 	MultiKeyResponse command;
 };
 
-// 按 key 路由的请求；拒绝过大 SET 的删除操作也必须保持分片内顺序。
+// 按 key 路由的请求（装在 Envelope 里跨分片）；拒绝过大 SET 的删除操作也必须保持分片内顺序。
 using RequestData = std::variant<SingleKeyRequest, MultiKeyRequest, RejectedSetRequest>;
 using ResponseData = std::variant<SingleKeyResponse, ErrorResponse, ShardResponse>;
 
@@ -43,13 +43,5 @@ struct RingResponseMessage {
 	uint64_t tcp_id; // tcp编号
 	uint32_t seq;    // 请求编号，允许回绕
 	RingResponseData data;
-};
-
-// 负责抽象发送数据 和响应回调，每个线程都持有这样一个worker，并且可以通过worker和其他线程的mailbox来进行通信
-struct RequestMessage {
-	uint64_t tcp_id; // tcp的32位fd编号
-	uint32_t seq;    // 请求编号，允许回绕
-	uint16_t shard_id; // 发送这条请求的分片，响应会发回这里
-	RequestData data;
 };
 } // namespace comm

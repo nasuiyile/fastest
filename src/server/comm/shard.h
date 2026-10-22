@@ -1,4 +1,5 @@
 #pragma once
+#include "envelope.h"
 #include "mailbox.h"
 #include <vector>
 #include <memory>
@@ -10,18 +11,16 @@ namespace fastest {
 namespace asio = boost::asio;
 using asio::awaitable;
 
-// 一个分片的收件箱：收请求、收响应两个 MPSC mailbox，共用一个门铃。
-template <typename Request, typename Response>
+// 一个分片的收件箱：一个 MPSC 收件队列加一个门铃。别人发来的请求信封和自己发出去、带着响应回来的信封都进这一个队列，
+// 用 Envelope::returned() 区分。
 struct ShardInbox {
 	Doorbell doorbell;
-	Mailbox<Request> requests;
-	Mailbox<Response> responses;
+	MpscQueue<Envelope> mailbox;
 };
 
-template <typename Request, typename Response>
 class SharedSystem {
 public:
-	using Inbox = ShardInbox<Request, Response>;
+	using Inbox = ShardInbox;
 
 	explicit SharedSystem(std::size_t n) {
 		inboxes_.reserve(n);
@@ -46,11 +45,10 @@ private:
 	std::vector<std::unique_ptr<Inbox>> inboxes_ {};
 };
 
-template <typename Request, typename Response>
 class ShardComm {
 public:
-	using System = SharedSystem<Request, Response>;
-	using Inbox = typename System::Inbox;
+	using System = SharedSystem;
+	using Inbox = System::Inbox;
 
 	static std::vector<ShardComm> create_shard_comm(const std::size_t num) {
 		std::vector<ShardComm> vec;
@@ -80,13 +78,9 @@ public:
 		return shard_id == shard_id_;
 	}
 
-	// 只入队，不敲门；调用方（Worker）负责之后敲目标分片的门铃。
-	bool push_request(std::size_t shard_id, std::unique_ptr<Request> message) {
-		return system_->inbox(shard_id).requests.try_push(message);
-	}
-
-	bool push_response(std::size_t shard_id, std::unique_ptr<Response> message) {
-		return system_->inbox(shard_id).responses.try_push(message);
+	// 只入队，不敲门；调用方（Worker）负责之后敲目标分片的门铃。信封交给目标分片的队列。
+	void push(const std::size_t shard_id, Envelope *envelope) const noexcept {
+		system_->inbox(shard_id).mailbox.push(envelope);
 	}
 
 	[[nodiscard]] inline std::size_t get_shard(const uint64_t hash) const {
