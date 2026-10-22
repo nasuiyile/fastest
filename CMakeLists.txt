@@ -35,6 +35,7 @@ add_executable(fastest
         src/server/comm/type.h
         src/server/comm/config.h
         src/protocol/memcached_parser.h
+        src/protocol/memcached_number.h
         src/protocol/memcached_response.h
         src/protocol/memcached_response.h
         src/cache/shard_cache.h

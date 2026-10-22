@@ -18,6 +18,7 @@
 
 #include "../cache/type.h"
 #include "../util/clock.h"
+#include "memcached_number.h"
 
 namespace fastest {
 
@@ -245,7 +246,10 @@ enum class ParseErrorCode : std::uint8_t {
 	BadDataChunk,
 	TooManyKeys,
 	CommandLineTooLong,
-	InvalidLineEnding
+	InvalidLineEnding,
+	InvalidExptime,    // touch/gat/gats 的 exptime 非法：CLIENT_ERROR invalid exptime argument
+	InvalidDelta,      // incr/decr 的 delta 非法：CLIENT_ERROR invalid numeric delta argument
+	BadDeleteArguments // delete 的可选参数非法：CLIENT_ERROR bad command line format.  Usage: ...
 };
 
 enum class ErrorRecovery : std::uint8_t {
@@ -389,15 +393,19 @@ private:
 	// 协议 exptime -> 绝对 expired_at。相对时间需要 now，按批惰性读取一次。
 	class ExpiryCache {
 	public:
-		[[nodiscard]] std::uint32_t to_expired_at(const std::uint32_t exptime) noexcept {
+		// exptime 是 memcached 的 int32：负数立即过期（EXPTIME_TO_POSITIVE_TIME 换成纪元前的时间戳）。
+		[[nodiscard]] std::uint32_t to_expired_at(const std::int32_t exptime) noexcept {
 			if (exptime == 0) {
 				return util::ExpiryClock::kNever;
+			}
+			if (exptime < 0) {
+				return util::ExpiryClock::kExpired;
 			}
 			if (now_ == 0) {
 				now_ = util::ExpiryClock::now();
 				epoch_unix_ = util::ExpiryClock::epoch_unix();
 			}
-			return util::ExpiryClock::to_expired_at(exptime, now_, epoch_unix_);
+			return util::ExpiryClock::to_expired_at(static_cast<std::uint32_t>(exptime), now_, epoch_unix_);
 		}
 
 	private:
@@ -485,6 +493,33 @@ private:
 		return noreply && cursor.done();
 	}
 
+	// 可选参数存在时它就是最后一个参数，否则是它前面那个。
+	[[nodiscard]] static std::string_view last_argument(const std::string_view optional,
+	                                                    const std::string_view previous) noexcept {
+		return optional.empty() ? previous : optional;
+	}
+
+	// touch / incr / decr：命令名后面 2 到 3 个参数，否则 ERROR（memcached 的 WANT_TOKENS_OR(ntokens, 4, 5)）。
+	// noreply 只看最后一个参数（set_noreply_maybe）：第三个参数不是 noreply 时被忽略；
+	// 只有两个参数而第二个是 noreply 时同样算 noreply，随后的数字格式错误不回复。
+	// 检查顺序与 memcached 相同：参数个数 -> key -> 数字。
+	struct KeyNumberArgs {
+		std::string_view key;
+		std::string_view number;
+		bool noreply = false;
+	};
+
+	[[nodiscard]] static bool parse_key_number_args(TokenCursor &cursor, KeyNumberArgs &args) noexcept {
+		args.key = cursor.next();
+		args.number = cursor.next();
+		const std::string_view option = cursor.next();
+		if (args.number.empty() || !cursor.done()) {
+			return false;
+		}
+		args.noreply = last_argument(option, args.number) == "noreply";
+		return true;
+	}
+
 	template <typename T>
 	static OneResult success(T command, std::size_t consumed) {
 		OneResult result;
@@ -537,17 +572,21 @@ private:
 		if (!cursor.done()) {
 			return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
 		}
-		const bool noreply = option == "noreply";
+		// memcached 的 set_noreply_maybe 只看最后一个参数：可选参数不是 noreply 时忽略；
+		// "set k 0 0 noreply" 也算 noreply，随后的格式错误不回复。
+		const bool noreply = last_argument(option, name == "cas" ? cas_text : bytes_text) == "noreply";
 		if (!valid_key(key)) {
 			return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset, 0, noreply);
 		}
 
 		std::uint32_t flags = 0;
-		std::uint32_t exptime = 0;
+		std::int32_t exptime = 0;
 		std::size_t value_bytes = 0;
 		std::uint64_t cas_unique = 0;
-		if (!parse_uint(flags_text, flags) || !parse_uint(exptime_text, exptime) ||
-		    !parse_uint(bytes_text, value_bytes) || (name == "cas" && !parse_uint(cas_text, cas_unique)) ||
+		// exptime 和 cas unique 按 memcached 的 safe_strtol / safe_strtoull 解析：负的 exptime 立即过期，
+		// 超出 int32 的 exptime 截断（例如 4294967295 即 -1）。
+		if (!parse_uint(flags_text, flags) || !parse_memcached_i32(exptime_text, exptime) ||
+		    !parse_uint(bytes_text, value_bytes) || (name == "cas" && !parse_memcached_u64(cas_text, cas_unique)) ||
 		    value_bytes > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() - 2)) {
 			return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::Continue, header_bytes, offset, 0, noreply);
 		}
@@ -631,11 +670,26 @@ private:
 
 	OneResult parse_retrieval(std::size_t offset, std::size_t header_bytes, std::string_view name, TokenCursor &cursor,
 	                          ExpiryCache &expiry) const {
-		std::uint32_t exptime = 0;
-		if ((name == "gat" || name == "gats") && !parse_uint(cursor.next(), exptime)) {
-			return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::Continue, header_bytes, offset);
+		std::uint32_t expired_at = util::ExpiryClock::kNever;
+		if (name == "gat" || name == "gats") {
+			// memcached：gat/gats 至少要带 exptime，否则 ERROR；exptime 非法是 invalid exptime argument；
+			// 只有 exptime、没有 key 时是合法的空查询，只回复 END（用空的 Multi* 表示，在本分片执行）。
+			const std::string_view exptime_text = cursor.next();
+			if (exptime_text.empty()) {
+				return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
+			}
+			std::int32_t exptime = 0;
+			if (!parse_memcached_i32(exptime_text, exptime)) {
+				return failure(ParseErrorCode::InvalidExptime, ErrorRecovery::Continue, header_bytes, offset);
+			}
+			expired_at = expiry.to_expired_at(exptime);
+			if (cursor.done()) {
+				if (name == "gat") {
+					return success(MultiGatCommand {expired_at, {}}, header_bytes);
+				}
+				return success(MultiGatsCommand {expired_at, {}}, header_bytes);
+			}
 		}
-		const std::uint32_t expired_at = expiry.to_expired_at(exptime);
 
 		const std::string_view first_key = cursor.next();
 		if (first_key.empty()) {
@@ -662,7 +716,7 @@ private:
 			return success(SingleGatsCommand {expired_at, ItemKey(std::string(first_key))}, header_bytes);
 		}
 
-		// 至少两个 Key 时返回 Multi*，保留原有数量和合法性检查。
+		// 至少两个 Key 时返回 Multi*（gat/gats 没有 key 时也是空的 Multi*），保留原有数量和合法性检查。
 		std::vector<ItemKey> keys;
 		keys.push_back(ItemKey(std::string(first_key)));
 		while (!cursor.done()) {
@@ -721,45 +775,61 @@ private:
 			return parse_retrieval(offset, header_bytes, name, cursor, expiry);
 		}
 		if (name == "delete") {
+			// memcached：delete <key> [0] [noreply]，1 到 3 个参数，否则 ERROR。
+			// 可选参数只能是旧版的 hold time "0" 和/或 noreply，否则回复带用法的 CLIENT_ERROR。
 			const std::string_view key = cursor.next();
-			if (!valid_key(key)) {
-				return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset);
+			const std::string_view first = cursor.next();
+			const std::string_view second = cursor.next();
+			if (key.empty() || !cursor.done()) {
+				return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
 			}
 			bool noreply = false;
-			if (!parse_noreply(cursor, noreply)) {
-				return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::Continue, header_bytes, offset);
+			if (!first.empty()) {
+				noreply = last_argument(second, first) == "noreply";
+				const bool hold_is_zero = first == "0";
+				if (second.empty() ? !(hold_is_zero || noreply) : !(hold_is_zero && noreply)) {
+					return failure(ParseErrorCode::BadDeleteArguments, ErrorRecovery::Continue, header_bytes, offset, 0,
+					               noreply);
+				}
+			}
+			if (!valid_key(key)) {
+				return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset, 0, noreply);
 			}
 			return success(DeleteCommand {ItemKey(std::string(key)), noreply}, header_bytes);
 		}
 		if (name == "touch") {
-			const std::string_view key = cursor.next();
-			if (!valid_key(key)) {
-				return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset);
+			KeyNumberArgs args;
+			if (!parse_key_number_args(cursor, args)) {
+				return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
 			}
-			std::uint32_t exptime = 0;
-			if (!parse_uint(cursor.next(), exptime)) {
-				return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::Continue, header_bytes, offset);
+			if (!valid_key(args.key)) {
+				return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset, 0,
+				               args.noreply);
 			}
-			bool noreply = false;
-			if (!parse_noreply(cursor, noreply)) {
-				return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::Continue, header_bytes, offset);
+			std::int32_t exptime = 0;
+			if (!parse_memcached_i32(args.number, exptime)) {
+				return failure(ParseErrorCode::InvalidExptime, ErrorRecovery::Continue, header_bytes, offset, 0,
+				               args.noreply);
 			}
-			return success(TouchCommand {ItemKey(std::string(key)), expiry.to_expired_at(exptime), noreply},
+			return success(TouchCommand {ItemKey(std::string(args.key)), expiry.to_expired_at(exptime), args.noreply},
 			               header_bytes);
 		}
 		if (name == "incr" || name == "decr") {
-			const std::string_view key = cursor.next();
-			if (!valid_key(key)) {
-				return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset);
+			KeyNumberArgs args;
+			if (!parse_key_number_args(cursor, args)) {
+				return failure(ParseErrorCode::BadArgumentCount, ErrorRecovery::Continue, header_bytes, offset);
+			}
+			if (!valid_key(args.key)) {
+				return failure(ParseErrorCode::InvalidKey, ErrorRecovery::Continue, header_bytes, offset, 0,
+				               args.noreply);
 			}
 			std::uint64_t delta = 0;
-			if (!parse_uint(cursor.next(), delta)) {
-				return failure(ParseErrorCode::InvalidNumber, ErrorRecovery::Continue, header_bytes, offset);
+			if (!parse_memcached_u64(args.number, delta)) {
+				return failure(ParseErrorCode::InvalidDelta, ErrorRecovery::Continue, header_bytes, offset, 0,
+				               args.noreply);
 			}
-			bool noreply = false;
-			if (!parse_noreply(cursor, noreply)) {
-				return failure(ParseErrorCode::BadCommandLine, ErrorRecovery::Continue, header_bytes, offset);
-			}
+			const bool noreply = args.noreply;
+			const std::string_view key = args.key;
 			if (name == "incr") {
 				return success(IncrCommand {ItemKey(std::string(key)), delta, noreply}, header_bytes);
 			}

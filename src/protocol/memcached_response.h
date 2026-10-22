@@ -117,14 +117,15 @@ struct TouchResponse {
 	TouchStatus status = TouchStatus::Touched;
 };
 
-// Reply 时 value 有值输出数值，无值输出 NOT_FOUND；NoReply 时忽略 value。
-enum class ArithmeticStatus : std::uint8_t { Reply, NoReply };
+// Value 输出计算后的数值（只有这时 value 有意义）；NotFound 输出 NOT_FOUND；
+// NonNumeric 输出 memcached 的 CLIENT_ERROR cannot increment or decrement non-numeric value；NoReply 不输出。
+enum class ArithmeticStatus : std::uint8_t { Value, NotFound, NonNumeric, NoReply };
 
 template <ResponseType Type>
 struct ArithmeticResponseT {
 	static constexpr ResponseType response_type = Type;
-	std::optional<std::uint64_t> value;
-	ArithmeticStatus status = ArithmeticStatus::Reply;
+	std::uint64_t value = 0;
+	ArithmeticStatus status = ArithmeticStatus::Value;
 };
 
 using IncrResponse = ArithmeticResponseT<ResponseType::Incr>;
@@ -213,6 +214,16 @@ struct ErrorResponse {
 		break;
 	case ParseErrorCode::InvalidLineEnding:
 		response.message = "invalid line ending";
+		break;
+	case ParseErrorCode::InvalidExptime:
+		response.message = "invalid exptime argument";
+		break;
+	case ParseErrorCode::InvalidDelta:
+		response.message = "invalid numeric delta argument";
+		break;
+	case ParseErrorCode::BadDeleteArguments:
+		// 与 memcached 逐字节相同（句号后两个空格）。
+		response.message = "bad command line format.  Usage: delete <key> [noreply]";
 		break;
 	default:
 		response.kind = ResponseErrorKind::ServerError;
@@ -572,18 +583,20 @@ bool emit_concrete(Sink &out, const T &value) {
 		out.append(touch_text(value.status));
 	} else if constexpr (IsArithmeticResponse<T>::value) {
 		switch (value.status) {
+		case ArithmeticStatus::Value:
+			out.append_uint(value.value);
+			out.append("\r\n");
+			break;
+		case ArithmeticStatus::NotFound:
+			out.append("NOT_FOUND\r\n");
+			break;
+		case ArithmeticStatus::NonNumeric:
+			out.append("CLIENT_ERROR cannot increment or decrement non-numeric value\r\n");
+			break;
 		case ArithmeticStatus::NoReply:
-			return false;
-		case ArithmeticStatus::Reply:
 			break;
 		default:
 			throw std::invalid_argument("invalid arithmetic response status");
-		}
-		if (value.value) {
-			out.append_uint(*value.value);
-			out.append("\r\n");
-		} else {
-			out.append("NOT_FOUND\r\n");
 		}
 	} else if constexpr (std::is_same_v<T, FlushAllResponse> || std::is_same_v<T, VerbosityResponse>) {
 		out.append(ok_text(value.status));

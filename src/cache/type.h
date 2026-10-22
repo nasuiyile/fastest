@@ -130,6 +130,8 @@ private:
 // 一次分配：[CacheValue 24B][payload][\r\n]。
 // 发布后（插进 map 或 share 给别的线程）：payload、cas、flags 只读；
 // expired_at 只有 owner 线程读写（touch/gat 原地改），远端线程不得读。
+// 唯一的例外是 incr/decr：owner 线程在 exclusively_owned()（只有 map 持有）时原地改写数字和 cas，
+// 对应 memcached 在 refcount == 2 时的原地替换；有在途引用时改为分配新 value（见 ShardCache::store_number）。
 class CacheValue {
 public:
 	CacheValue(const CacheValue &) = delete;
@@ -182,6 +184,13 @@ public:
 	[[nodiscard]] std::uint32_t use_count() const noexcept {
 		return ref_count_.load(std::memory_order_relaxed);
 	}
+
+	// 已发布的 value 是否只剩调用者这一份引用（例如只有 map 持有，没有在途响应）。
+	// acquire 与其他线程 release() 的 acq_rel 配对：它们对 payload 的读取先于之后的原地改写。
+	// 只有 owner 线程能新增引用（share() 只在 owner 线程的 map 查找后调用），所以结果在 owner 线程上不会失效。
+	[[nodiscard]] bool exclusively_owned() const noexcept {
+		return ref_count_.load(std::memory_order_acquire) == 1;
+	}
 	[[nodiscard]] std::size_t size() const noexcept {
 		return size_;
 	}
@@ -198,7 +207,8 @@ public:
 	[[nodiscard]] std::string_view view_crlf() const noexcept {
 		return {reinterpret_cast<const char *>(payload()), size_ + std::size_t {2}};
 	}
-	// 仅限发布前（还没插进 map、也没 share 给别的线程）由唯一持有者写入；结尾两个字节是 CRLF 槽位。
+	// 仅限唯一持有者写入：发布前（还没插进 map、也没 share 给别的线程），或者 owner 线程确认 exclusively_owned()。
+	// 结尾两个字节是 CRLF 槽位。
 	[[nodiscard]] std::span<std::byte> mutable_bytes_crlf() noexcept {
 		return {payload(), size_ + std::size_t {2}};
 	}

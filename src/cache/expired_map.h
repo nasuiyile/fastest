@@ -26,7 +26,7 @@ namespace fastest {
 // ttl_count_：map 里带过期时间（expired_at != kNever）的条目数。插入带过期时间的 value 时加一，
 // 这样的条目以任何方式离开 map（覆盖、delete、惰性删除、采样删除）时减一；为 0 时 sample_expired() 直接返回。
 // 只由所属线程读写，是普通整数而不是 atomic；放在 map 对象里，不给每个 pair 增加任何内存。
-// 以后 touch/gat 原地修改 expired_at 时，必须经过本类同步调整计数，不能绕过它直接改 value。
+// touch/gat 原地修改 expired_at 必须经过 touch()，由它同步调整计数，不能绕过它直接改 value。
 class ExpiredMap {
 public:
 	using Map = IncrementalHashMap<CacheValue>;
@@ -105,6 +105,39 @@ public:
 			}
 			// 新旧是同一块内存时计数至少为 2（map 一次 + 刚交出的一次），这里只减掉多出的一次，不会销毁。
 			release_value(previous);
+		}
+	}
+
+	// add：key 不存在（或已过期）时插入并接管 value 那次计数，返回 true；存在且未过期时返回 false，所有权不变。
+	// 先直接插入：key 不存在（add 成功的情况）只有一次查找；已存在时再查一次判断是否过期，过期的当场删除后插入。
+	// 抛异常时所有权不变，value 仍归调用者。
+	bool insert(const ItemKey &key, CacheValuePtr &&value, std::uint32_t &now) {
+		CacheValue *const raw = value.get();
+		if (!map_.insert(key, raw)) {
+			if (find(key, now) != nullptr) {
+				return false;
+			}
+			const bool inserted = map_.insert(key, raw);
+			assert(inserted);
+			(void)inserted;
+		}
+		(void)value.release_ownership();
+		ttl_count_ += has_ttl(raw);
+		return true;
+	}
+
+	// touch / gat：原地改写 map 里 value 的过期时间，同步 ttl_count_。value 必须是本 map 刚 find() 到的指针。
+	// expired_at 只有 owner 线程读写，远端在途响应不读它，所以不需要复制 value；不改变 memory_usage()。
+	void touch(CacheValue *value, const std::uint32_t expired_at) noexcept {
+		const bool had_ttl = has_ttl(value);
+		value->expired_at = expired_at;
+		const bool has = has_ttl(value);
+		if (had_ttl != has) {
+			if (has) {
+				++ttl_count_;
+			} else {
+				drop_ttl();
+			}
 		}
 	}
 

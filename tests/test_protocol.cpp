@@ -996,3 +996,274 @@ TEST_CASE("ttl counter follows every way a ttl entry enters or leaves the map", 
 	REQUIRE(map.size() == 19);
 	REQUIRE(map.sample_expired(1000, at).sampled == 0);
 }
+
+namespace {
+// 单 key 命令的响应状态，按具体响应类型取出。
+template <typename Response>
+auto status_of(ShardCache &cache, const std::string_view input) {
+	return std::get<Response>(execute(cache, input).variant()).status;
+}
+
+MultiKeyResponse execute_multi(ShardCache &cache, const std::string_view input) {
+	auto batch = parse(input);
+	REQUIRE(batch.commands.size() == 1);
+	return cache.handle_multi_command(std::move(std::get<MultiKeyCommand>(batch.commands[0])));
+}
+
+std::string wire_of(const SingleKeyResponse &response) {
+	std::string wire;
+	detail::StringSink sink {wire};
+	encode_to(sink, response);
+	return wire;
+}
+} // namespace
+
+TEST_CASE("memcached number parsing mirrors safe_strtoull and safe_strtol", "[number]") {
+	constexpr auto u64 = [](std::string_view text) -> std::optional<std::uint64_t> {
+		std::uint64_t value = 0;
+		return parse_memcached_u64(text, value) ? std::optional(value) : std::nullopt;
+	};
+	constexpr auto i32 = [](std::string_view text) -> std::optional<std::int32_t> {
+		std::int32_t value = 0;
+		return parse_memcached_i32(text, value) ? std::optional(value) : std::nullopt;
+	};
+	static_assert(u64("0") == 0 && u64("+5") == 5 && u64(" \t5") == 5 && u64("5 abc") == 5);
+	static_assert(u64(std::string_view("7\0x", 3)) == 7); // NUL 结束数字
+	static_assert(u64("18446744073709551615") == UINT64_MAX && !u64("18446744073709551616"));
+	static_assert(u64("-0") == 0 && !u64("-1") && !u64("-5")); // strtoull 取反后为负才拒绝
+	static_assert(!u64("") && !u64(" ") && !u64("+") && !u64("+-1") && !u64("5x") && !u64("0x1") && !u64("1.5"));
+	static_assert(i32("100") == 100 && i32("-1") == -1 && i32("+5") == 5);
+	static_assert(i32("4294967295") == -1 && i32("2147483648") == INT32_MIN); // 截断成 int32
+	static_assert(i32("-2147483649") == INT32_MAX && i32("-9223372036854775808") == 0);
+	static_assert(i32("9223372036854775807") == -1 && !i32("9223372036854775808")); // long 溢出才失败
+	static_assert(!i32("abc") && !i32("") && !i32("1.5"));
+	SUCCEED();
+}
+
+TEST_CASE("key command argument errors follow memcached", "[protocol]") {
+	struct Expect {
+		std::string_view input;
+		ParseErrorCode code;
+		bool noreply;
+	};
+	for (const auto &[input, code, noreply] : std::initializer_list<Expect> {
+	         {"touch\r\n", ParseErrorCode::BadArgumentCount, false},
+	         {"touch k\r\n", ParseErrorCode::BadArgumentCount, false},
+	         {"touch k 1 noreply x\r\n", ParseErrorCode::BadArgumentCount, false},
+	         {"touch k abc\r\n", ParseErrorCode::InvalidExptime, false},
+	         {"touch k abc noreply\r\n", ParseErrorCode::InvalidExptime, true},
+	         {"touch k noreply\r\n", ParseErrorCode::InvalidExptime, true}, // 最后一个参数是 noreply
+	         {"incr k\r\n", ParseErrorCode::BadArgumentCount, false},
+	         {"incr k -1\r\n", ParseErrorCode::InvalidDelta, false},
+	         {"decr k 18446744073709551616 noreply\r\n", ParseErrorCode::InvalidDelta, true},
+	         {"gat\r\n", ParseErrorCode::BadArgumentCount, false},
+	         {"gat abc k\r\n", ParseErrorCode::InvalidExptime, false},
+	         {"gats noreply k\r\n", ParseErrorCode::InvalidExptime, false},
+	         {"delete\r\n", ParseErrorCode::BadArgumentCount, false},
+	         {"delete k 0 noreply x\r\n", ParseErrorCode::BadArgumentCount, false},
+	         {"delete k 1\r\n", ParseErrorCode::BadDeleteArguments, false},
+	         {"delete k 0 0\r\n", ParseErrorCode::BadDeleteArguments, false},
+	         {"delete k x noreply\r\n", ParseErrorCode::BadDeleteArguments, true},
+	         {"set k 0 0 noreply\r\n", ParseErrorCode::InvalidNumber, true},
+	         {"set k 0 9223372036854775808 1\r\n", ParseErrorCode::InvalidNumber, false},
+	     }) {
+		CAPTURE(input);
+		const auto result = parse(input);
+		REQUIRE(result.stop == StopReason::Error);
+		REQUIRE(result.error->code == code);
+		REQUIRE(result.error->noreply == noreply);
+		REQUIRE(result.error->recovery == ErrorRecovery::Continue);
+	}
+	REQUIRE(to_error_response(*parse("touch k x\r\n").error).message == "invalid exptime argument");
+	REQUIRE(to_error_response(*parse("incr k x\r\n").error).message == "invalid numeric delta argument");
+	REQUIRE(to_error_response(*parse("delete k 1\r\n").error).message ==
+	        "bad command line format.  Usage: delete <key> [noreply]");
+	REQUIRE(to_error_response(*parse("touch\r\n").error).kind == ResponseErrorKind::Error);
+
+	// 合法的写法：多余的非 noreply 参数被忽略，旧版的 delete hold time 0。
+	auto ok = parse("touch k 10 garbage\r\nincr k +2 garbage\r\ndelete k 0\r\ndelete k 0 noreply\r\n"
+	                "set k 0 -1 1 garbage\r\nx\r\ngat 100\r\ngats 0\r\n");
+	REQUIRE(ok.stop == StopReason::EndOfInput);
+	REQUIRE(ok.commands.size() == 7);
+	const auto single = [&](std::size_t i) -> auto & {
+		return std::get<SingleKeyCommand>(ok.commands[i]).command;
+	};
+	REQUIRE_FALSE(std::get<TouchCommand>(single(0)).noreply);
+	REQUIRE(std::get<IncrCommand>(single(1)).delta == 2);
+	REQUIRE_FALSE(std::get<DeleteCommand>(single(2)).noreply);
+	REQUIRE(std::get<DeleteCommand>(single(3)).noreply);
+	REQUIRE(std::get<SetCommand>(single(4)).value->expired_at == util::ExpiryClock::kExpired); // 负数立即过期
+	// gat/gats 只带 exptime 时是空查询：空的 Multi*，只回复 END。
+	REQUIRE(std::get<MultiGatCommand>(std::get<MultiKeyCommand>(ok.commands[5]).command).keys.empty());
+	REQUIRE(std::get<MultiGatsCommand>(std::get<MultiKeyCommand>(ok.commands[6]).command).keys.empty());
+}
+
+TEST_CASE("add, replace, append and prepend follow memcached's store rules", "[store]") {
+	using util::ExpiryClock;
+	ShardCache cache(3, 8);
+	REQUIRE(status_of<AddResponse>(cache, "add k 1 0 1\r\na\r\n") == StorageStatus::Stored);
+	const std::uint64_t added = cache.peek(ItemKey("k"))->cas;
+	REQUIRE(added == ((std::uint64_t {1} << 16) | 3));
+	REQUIRE(status_of<AddResponse>(cache, "add k 2 0 1\r\nb\r\n") == StorageStatus::NotStored);
+	REQUIRE(status_of<AddResponse>(cache, "add k 2 0 1 noreply\r\nb\r\n") == StorageStatus::NoReply);
+	REQUIRE(cache.peek(ItemKey("k"))->view() == "a");
+	REQUIRE(cache.peek(ItemKey("k"))->cas == added); // 没写入的 add 不改旧值，也不消耗版本号
+
+	// 过期的 key 等同于不存在：add 写入，replace/append/prepend 不写。
+	cache_set(cache, "dead", CacheValue::create("x", 0, ExpiryClock::kExpired));
+	REQUIRE(cache.ttl_count() == 1);
+	REQUIRE(status_of<ReplaceResponse>(cache, "replace dead 0 0 1\r\ny\r\n") == StorageStatus::NotStored);
+	REQUIRE(cache.ttl_count() == 0); // find() 顺手删除，计数同步
+	cache_set(cache, "dead", CacheValue::create("x", 0, ExpiryClock::kExpired));
+	REQUIRE(status_of<AppendResponse>(cache, "append dead 0 0 1\r\ny\r\n") == StorageStatus::NotStored);
+	cache_set(cache, "dead", CacheValue::create("x", 0, ExpiryClock::kExpired));
+	REQUIRE(status_of<PrependResponse>(cache, "prepend dead 0 0 1\r\ny\r\n") == StorageStatus::NotStored);
+	cache_set(cache, "dead", CacheValue::create("x", 0, ExpiryClock::kExpired));
+	REQUIRE(status_of<AddResponse>(cache, "add dead 4 100 1\r\ny\r\n") == StorageStatus::Stored);
+	REQUIRE(cache.peek(ItemKey("dead"))->view() == "y");
+	REQUIRE(cache.ttl_count() == 1);
+	REQUIRE(status_of<ReplaceResponse>(cache, "replace missing 0 0 1\r\ny\r\n") == StorageStatus::NotStored);
+	REQUIRE(cache.peek(ItemKey("missing")) == nullptr);
+
+	// replace 使用新的 flags 和过期时间。
+	REQUIRE(status_of<ReplaceResponse>(cache, "replace dead 6 0 1\r\nz\r\n") == StorageStatus::Stored);
+	REQUIRE(cache.peek(ItemKey("dead"))->flags == 6);
+	REQUIRE(cache.ttl_count() == 0);
+
+	// append/prepend 保留旧值的 flags 和过期时间，换新 cas；旧值仍归在途响应。
+	const std::uint32_t at = ExpiryClock::now() + 1000;
+	cache_set(cache, "c", CacheValue::create("mm", 5, at));
+	const auto held = cache_get(cache, "c");
+	const std::uint64_t before = held->value->cas;
+	REQUIRE(status_of<AppendResponse>(cache, "append c 9 -1 2\r\n>>\r\n") == StorageStatus::Stored);
+	REQUIRE(status_of<PrependResponse>(cache, "prepend c 7 0 2\r\n<<\r\n") == StorageStatus::Stored);
+	const CacheValue *merged = cache.peek(ItemKey("c"));
+	REQUIRE(merged->view() == "<<mm>>");
+	REQUIRE(merged->view_crlf() == "<<mm>>\r\n");
+	REQUIRE(merged->flags == 5);
+	REQUIRE(merged->expired_at == at);
+	REQUIRE(merged->cas > before);
+	REQUIRE(held->value->view() == "mm");
+	REQUIRE(cache.ttl_count() == 1);
+	REQUIRE(status_of<AppendResponse>(cache, "append c 0 0 0 noreply\r\n\r\n") == StorageStatus::NoReply);
+	REQUIRE(cache.peek(ItemKey("c"))->view() == "<<mm>>");
+
+	// 合并后超过上限（这里是 8 字节）时 NOT_STORED，旧值不变。
+	REQUIRE(status_of<AppendResponse>(cache, "append c 0 0 2\r\n12\r\n") == StorageStatus::Stored);
+	REQUIRE(status_of<PrependResponse>(cache, "prepend c 0 0 1\r\n!\r\n") == StorageStatus::NotStored);
+	REQUIRE(cache.peek(ItemKey("c"))->view() == "<<mm>>12");
+}
+
+TEST_CASE("touch and gat change only expired_at and keep the TTL count", "[expiry]") {
+	using util::ExpiryClock;
+	ShardCache cache;
+	CacheValuePtr value = CacheValue::create("v", 4);
+	const CacheValue *raw = value.get();
+	cache_set(cache, "k", std::move(value));
+	const std::uint64_t version = raw->cas;
+	REQUIRE(cache.ttl_count() == 0);
+
+	REQUIRE(status_of<TouchResponse>(cache, "touch k 100\r\n") == TouchStatus::Touched);
+	REQUIRE(cache.peek(ItemKey("k")) == raw); // 原地修改，不复制 value
+	REQUIRE(raw->expired_at > ExpiryClock::now());
+	REQUIRE(cache.ttl_count() == 1);
+	REQUIRE(status_of<TouchResponse>(cache, "touch k 200 noreply\r\n") == TouchStatus::NoReply);
+	REQUIRE(cache.ttl_count() == 1);
+
+	auto gat = execute(cache, "gats 0 k\r\n");
+	const auto &item = *std::get<SingleGatsResponse>(gat.variant()).item;
+	REQUIRE(item.value.get() == raw);
+	REQUIRE(raw->expired_at == ExpiryClock::kNever);
+	REQUIRE(cache.ttl_count() == 0);
+	REQUIRE(raw->cas == version); // touch/gat 不换 cas
+	REQUIRE(wire_of(gat) == "VALUE k 4 1 " + std::to_string(version) + "\r\nv\r\nEND\r\n");
+
+	// 负的 exptime：这次照常返回，之后未命中；重复的 key 只命中第一次。
+	cache_set(cache, "a", CacheValue::create("A"));
+	cache_set(cache, "b", CacheValue::create("B"));
+	auto multi = execute_multi(cache, "gat -1 a a b missing\r\n");
+	const auto &items = std::get<MultiGatResponse>(multi.variant()).items;
+	REQUIRE(items.size() == 2);
+	REQUIRE(items[0].key == "a");
+	REQUIRE(items[1].key == "b");
+	REQUIRE(cache.ttl_count() == 1); // 第二个 a 碰到过期并顺手删除，只剩 b
+	REQUIRE(cache.peek(ItemKey("a")) == nullptr);
+	REQUIRE(cache.size() == 2);
+	REQUIRE(status_of<TouchResponse>(cache, "touch b 100\r\n") == TouchStatus::NotFound);
+	REQUIRE(cache.ttl_count() == 0);
+	REQUIRE(cache.size() == 1);
+	REQUIRE(std::get<MultiGatsResponse>(execute_multi(cache, "gats 100\r\n").variant()).items.empty());
+
+	// 主动采样看到的 TTL 数与 touch/gat 的修改一致。
+	REQUIRE(status_of<TouchResponse>(cache, "touch k -1\r\n") == TouchStatus::Touched);
+	REQUIRE(cache.ttl_count() == 1);
+	REQUIRE(cache.sample_expired(10).expired == 1);
+	REQUIRE(cache.size() == 0);
+	REQUIRE(cache.ttl_count() == 0);
+}
+
+TEST_CASE("incr and decr rewrite in place only while the map holds the only reference", "[arithmetic]") {
+	using util::ExpiryClock;
+	ShardCache cache;
+	const auto arithmetic = [&](const std::string_view input) {
+		return wire_of(execute(cache, input));
+	};
+	REQUIRE(arithmetic("incr k 1\r\n") == "NOT_FOUND\r\n");
+
+	const std::uint32_t at = ExpiryClock::now() + 1000;
+	cache_set(cache, "k", CacheValue::create("1000", 7, at));
+	const CacheValue *raw = cache.peek(ItemKey("k"));
+	const std::uint64_t first = raw->cas;
+	REQUIRE(arithmetic("decr k 999\r\n") == "1\r\n");
+	REQUIRE(cache.peek(ItemKey("k")) == raw); // 不分配：长度不变，补空格
+	REQUIRE(raw->view_crlf() == "1   \r\n");
+	REQUIRE(raw->cas > first);
+	REQUIRE(raw->flags == 7);
+	REQUIRE(raw->expired_at == at);
+
+	// 有在途响应引用时不能原地改：新 value 同样补空格，旧值不变。
+	const auto held = cache_get(cache, "k");
+	REQUIRE(arithmetic("incr k 41\r\n") == "42\r\n");
+	const CacheValue *fresh = cache.peek(ItemKey("k"));
+	REQUIRE(fresh != raw);
+	REQUIRE(fresh->view_crlf() == "42  \r\n");
+	REQUIRE(fresh->flags == 7);
+	REQUIRE(fresh->expired_at == at);
+	REQUIRE(held->value->view() == "1   ");
+	REQUIRE(cache.ttl_count() == 1);
+
+	// 数字变长：刚好装下数字。
+	REQUIRE(arithmetic("incr k 99958\r\n") == "100000\r\n");
+	REQUIRE(cache.peek(ItemKey("k"))->view_crlf() == "100000\r\n");
+	REQUIRE(arithmetic("decr k 100001\r\n") == "0\r\n"); // decr 最小到 0
+	REQUIRE(arithmetic("incr k 18446744073709551615\r\n") == "18446744073709551615\r\n");
+	REQUIRE(arithmetic("incr k 2\r\n") == "1\r\n"); // 64 位回绕
+	REQUIRE(arithmetic("incr k 1 noreply\r\n").empty());
+	REQUIRE(cache.peek(ItemKey("k"))->view() == "2                   ");
+
+	cache_set(cache, "text", CacheValue::create("12abc"));
+	REQUIRE(arithmetic("incr text 1\r\n") == "CLIENT_ERROR cannot increment or decrement non-numeric value\r\n");
+	REQUIRE(arithmetic("decr text 1 noreply\r\n").empty());
+	cache_set(cache, "dead", CacheValue::create("1", 0, ExpiryClock::kExpired));
+	REQUIRE(arithmetic("incr dead 1\r\n") == "NOT_FOUND\r\n");
+	REQUIRE(cache.peek(ItemKey("dead")) == nullptr);
+}
+
+TEST_CASE("gat across shards touches each key on its own shard", "[protocol]") {
+	WorkerFixture f;
+	const auto local = shard_key(0);
+	const auto remote = shard_key(1);
+	f.set(local, "L");
+	f.set(remote, "R");
+	auto batch = parse("gat -1 " + local + " " + remote + "\r\ngat 100\r\n");
+	REQUIRE(batch.commands.size() == 2);
+	for (auto &command : batch.commands) {
+		f.workers[0].send_multi_command(std::move(std::get<MultiKeyCommand>(command)), f.id);
+	}
+	f.get(local);
+	f.get(remote);
+	f.start_mailboxes();
+	const std::string expected = "STORED\r\nSTORED\r\nVALUE " + local + " 0 1\r\nL\r\nVALUE " + remote +
+	                             " 0 1\r\nR\r\nEND\r\nEND\r\nEND\r\nEND\r\n";
+	REQUIRE(f.read(expected.size()) == expected);
+}
