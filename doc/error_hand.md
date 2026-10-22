@@ -20,6 +20,6 @@
 
 
 
-当前兼容边界：缓存实现了 set/get/gets/cas/delete，其他命令尚未实现；exptime 已在解析时换算并存进 value，但惰性过期和后台清理尚未实现；保留原有命令行、key 数量及 value 大小限制，数值与 memcached 的配置不完全一致。
+当前兼容边界：缓存实现了 set/get/gets/cas/delete，其他命令尚未实现；exptime 已在解析时换算并存进 value，惰性过期已实现，主动过期的采样接口（`ShardCache::sample_expired`）已提供，但还没有接入后台调度；保留原有命令行、key 数量及 value 大小限制，数值与 memcached 的配置不完全一致。
 另外，memcached 1.6.24 的某些非法 GET 路径会清空待发响应。例如同一流水线中的 SET 后接超长 key 的 GET，SET 已执行，但待发的 STORED 会被丢弃。
 当前实现保留成功前缀的响应，未复现这一特殊缓冲丢弃行为，所以这里的错误恢复对齐不代表完整协议或所有内部边界行为完全兼容。

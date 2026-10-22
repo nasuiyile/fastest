@@ -821,3 +821,178 @@ TEST_CASE("cas compares the client's version and stores a fresh one", "[cas]") {
 	REQUIRE_FALSE(encode_to(sink, multi));
 	REQUIRE(wire == "VALUE k 0 1 " + std::to_string(item.value->cas) + "\r\nd\r\nEND\r\n");
 }
+
+TEST_CASE("expired values read as misses and are removed lazily", "[expiry]") {
+	using util::ExpiryClock;
+	ShardCache cache;
+	const std::uint32_t future = ExpiryClock::now() + 1000;
+	cache_set(cache, "dead", CacheValue::create("x", 0, ExpiryClock::kExpired));
+	cache_set(cache, "alive", CacheValue::create("y", 0, future));
+	REQUIRE(cache.size() == 2);
+
+	// peek 只读：过期的返回 nullptr，但不删除。
+	REQUIRE(cache.peek(ItemKey("dead")) == nullptr);
+	REQUIRE(cache.peek(ItemKey("alive")) != nullptr);
+	REQUIRE(cache.size() == 2);
+
+	// get 未命中，并顺手删除。
+	REQUIRE_FALSE(cache_get(cache, "dead"));
+	REQUIRE(cache.size() == 1);
+	REQUIRE(cache_get(cache, "alive")->value->view() == "y");
+
+	// 多 key 的 gets 同样跳过过期的。
+	cache_set(cache, "dead", CacheValue::create("x", 0, ExpiryClock::kExpired));
+	auto multi = cache.handle_multi_command(MultiKeyCommand(MultiGetsCommand {{ItemKey("dead"), ItemKey("alive")}}));
+	const auto &items = std::get<MultiGetsResponse>(multi.variant()).items;
+	REQUIRE(items.size() == 1);
+	REQUIRE(items[0].key == "alive");
+	REQUIRE(cache.size() == 1);
+
+	// 覆盖过期的 key 等同于新写入。
+	cache_set(cache, "dead", CacheValue::create("again"));
+	REQUIRE(cache_get(cache, "dead")->value->view() == "again");
+}
+
+TEST_CASE("cas and delete treat expired values as absent", "[expiry]") {
+	using util::ExpiryClock;
+	ShardCache cache(1);
+	CacheValuePtr value = CacheValue::create("a", 0, ExpiryClock::kExpired);
+	const CacheValue *raw = value.get();
+	cache_set(cache, "k", std::move(value));
+	const std::uint64_t version = raw->cas; // map 仍持有它，只是已经过期
+	REQUIRE(std::get<CasResponse>(execute(cache, "cas k 0 0 1 " + std::to_string(version) + "\r\nb\r\n").variant())
+				.status == CasStatus::NotFound);
+	REQUIRE(cache.size() == 0);
+
+	cache_set(cache, "k", CacheValue::create("c", 0, ExpiryClock::kExpired));
+	REQUIRE(std::get<DeleteResponse>(execute(cache, "delete k\r\n").variant()).status == DeleteStatus::NotFound);
+	REQUIRE(cache.size() == 0);
+
+	cache_set(cache, "k", CacheValue::create("d"));
+	REQUIRE(std::get<DeleteResponse>(execute(cache, "delete k\r\n").variant()).status == DeleteStatus::Deleted);
+	REQUIRE(cache.size() == 0);
+}
+
+TEST_CASE("sample_expired removes expired entries and reports ttl stats", "[expiry]") {
+	using util::ExpiryClock;
+	ShardCache cache;
+	const std::uint32_t future = ExpiryClock::now() + 1000;
+	constexpr std::size_t kEach = 40;
+	const auto set_dead = [&] {
+		for (std::size_t i = 0; i < kEach; ++i) {
+			cache_set(cache, "dead:" + std::to_string(i), CacheValue::create("x", 0, ExpiryClock::kExpired));
+		}
+	};
+	set_dead();
+	for (std::size_t i = 0; i < kEach; ++i) {
+		cache_set(cache, "ttl:" + std::to_string(i), CacheValue::create("y", 0, future));
+		cache_set(cache, "forever:" + std::to_string(i), CacheValue::create("z"));
+	}
+	REQUIRE(cache.size() == 3 * kEach);
+	REQUIRE(cache.sample_expired(0).sampled == 0);
+
+	// 一次调用内访问 min(limit, size()) 个不同条目：limit 足够大时就是一次全量扫描。
+	const auto full = cache.sample_expired(1000);
+	REQUIRE(full.sampled == 3 * kEach);
+	REQUIRE(full.with_ttl == 2 * kEach);
+	REQUIRE(full.expired == kEach);
+	REQUIRE(cache.size() == 2 * kEach);
+	for (std::size_t i = 0; i < kEach; ++i) {
+		REQUIRE(cache.peek(ItemKey("ttl:" + std::to_string(i))) != nullptr);
+		REQUIRE(cache.peek(ItemKey("forever:" + std::to_string(i))) != nullptr);
+	}
+
+	// 小批量采样：游标在多次调用之间推进，最终清掉全部过期条目。
+	set_dead();
+	std::size_t removed = 0;
+	for (int round = 0; round < 1000 && cache.size() > 2 * kEach; ++round) {
+		const auto stats = cache.sample_expired(10);
+		REQUIRE(stats.sampled == 10);
+		REQUIRE(stats.expired <= stats.with_ttl);
+		removed += stats.expired;
+	}
+	REQUIRE(removed == kEach);
+	REQUIRE(cache.size() == 2 * kEach);
+}
+
+TEST_CASE("ExpiredMap expires at expired_at and only drops its own reference", "[expiry]") {
+	using util::ExpiryClock;
+	ExpiredMap map;
+	const std::uint32_t at = ExpiryClock::now() + 1000;
+	map.insert_or_assign(ItemKey("k"), CacheValue::create("v", 0, at));
+	map.insert_or_assign(ItemKey("forever"), CacheValue::create("f"));
+	CacheValue *found = map.find(ItemKey("k"));
+	REQUIRE(found != nullptr);
+	const CacheValuePtr held = CacheValuePtr::share(found); // 模拟在途响应
+	REQUIRE(held->use_count() == 2);
+
+	auto stats = map.sample_expired(10, at - 1);
+	REQUIRE(stats.sampled == 2);
+	REQUIRE(stats.with_ttl == 1);
+	REQUIRE(stats.expired == 0);
+	REQUIRE(map.size() == 2);
+
+	stats = map.sample_expired(10, at); // 到点即过期
+	REQUIRE(stats.expired == 1);
+	REQUIRE(map.size() == 1);
+	REQUIRE(held->use_count() == 1); // map 只释放自己那次计数，在途响应仍然有效
+	REQUIRE(held->view() == "v");
+	REQUIRE(map.find(ItemKey("forever"))->view() == "f");
+
+	// 用同一块内存覆盖：map 不会多持有一次计数。
+	map.insert_or_assign(ItemKey("k"), CacheValuePtr(held));
+	map.insert_or_assign(ItemKey("k"), CacheValuePtr(held));
+	REQUIRE(held->use_count() == 2);
+	REQUIRE(map.erase(ItemKey("k")));
+	REQUIRE(held->use_count() == 1);
+	REQUIRE_FALSE(map.erase(ItemKey("k")));
+}
+
+TEST_CASE("ttl counter follows every way a ttl entry enters or leaves the map", "[expiry]") {
+	using util::ExpiryClock;
+	ExpiredMap map;
+	const std::uint32_t at = ExpiryClock::now() + 1000;
+	for (int i = 0; i < 20; ++i) {
+		map.insert_or_assign(ItemKey("forever:" + std::to_string(i)), CacheValue::create("f"));
+	}
+	REQUIRE(map.ttl_count() == 0);
+	// 没有带过期时间的条目：采样直接返回，一个都不访问。
+	REQUIRE(map.sample_expired(10).sampled == 0);
+	REQUIRE(map.sample_expired(10, at).sampled == 0);
+
+	for (const char *key : {"a", "c", "d", "e"}) {
+		map.insert_or_assign(ItemKey(key), CacheValue::create(key, 0, at));
+	}
+	map.insert_or_assign(ItemKey("b"), CacheValue::create("b", 0, ExpiryClock::kExpired));
+	REQUIRE(map.ttl_count() == 5);
+
+	// 覆盖：带 TTL -> 带 TTL 不变，带 TTL -> 永久减一，永久 -> 带 TTL 加一。
+	map.insert_or_assign(ItemKey("a"), CacheValue::create("a2", 0, at));
+	REQUIRE(map.ttl_count() == 5);
+	map.insert_or_assign(ItemKey("a"), CacheValue::create("a3"));
+	REQUIRE(map.ttl_count() == 4);
+	map.insert_or_assign(ItemKey("forever:0"), CacheValue::create("t", 0, at));
+	REQUIRE(map.ttl_count() == 5);
+
+	// 惰性删除。
+	REQUIRE(map.find(ItemKey("b")) == nullptr);
+	REQUIRE(map.ttl_count() == 4);
+
+	// delete：未过期的返回 true，已过期的返回 false，两者都扣计数；永久的不扣。
+	REQUIRE(map.erase(ItemKey("c")));
+	REQUIRE(map.ttl_count() == 3);
+	map.insert_or_assign(ItemKey("x"), CacheValue::create("x", 0, ExpiryClock::kExpired));
+	REQUIRE(map.ttl_count() == 4);
+	REQUIRE_FALSE(map.erase(ItemKey("x")));
+	REQUIRE(map.ttl_count() == 3);
+	REQUIRE(map.erase(ItemKey("a")));
+	REQUIRE(map.ttl_count() == 3);
+
+	// 采样删除：d、e、forever:0 到点过期。
+	const auto stats = map.sample_expired(1000, at);
+	REQUIRE(stats.with_ttl == 3);
+	REQUIRE(stats.expired == 3);
+	REQUIRE(map.ttl_count() == 0);
+	REQUIRE(map.size() == 19);
+	REQUIRE(map.sample_expired(1000, at).sampled == 0);
+}

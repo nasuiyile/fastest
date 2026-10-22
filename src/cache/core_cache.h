@@ -337,8 +337,8 @@ public:
     //
     // The visitor receives Value* by value and may mutate the pointed-to Value,
     // but must NOT delete it, insert/assign/extract/erase, clear/compact, or
-    // recursively sample/mutate this map. Copy expired keys and
-    // erase them AFTER this method returns. Do not retain borrowed key views.
+    // recursively sample/mutate this map. To remove visited entries, use the
+    // three-argument overload below. Do not retain borrowed key views.
     // Read calls from the visitor are allowed; migration is paused until the
     // sampling call finishes. This does not permit concurrent thread access.
     //
@@ -346,39 +346,22 @@ public:
     // scan empty buckets. This is not a hard real-time maintenance budget.
     template <typename Visitor>
     std::size_t sample_next(std::size_t limit, Visitor&& visitor) {
-        assert(!callback_active_);
-        const std::size_t count = std::min(limit, size_);
-        std::size_t current_left = current_->size;
-        std::size_t old_left = old_ ? old_->size : 0;
+        auto keep = [](Value*) noexcept {};
+        return sample_impl<false>(limit, visitor, keep);
+    }
 
-        {
-            CallbackScope scope(callback_active_);
-            for (std::size_t i = 0; i < count; ++i) {
-                Table* table;
-                if (old_left != 0 && (current_left == 0 || sample_old_next_)) {
-                    table = old_.get();
-                    --old_left;
-                    sample_old_next_ = false;
-                } else {
-                    assert(current_left != 0);
-                    table = current_.get();
-                    --current_left;
-                    sample_old_next_ = true;
-                }
-
-                if (table->sample_cursor == table->set.end()) {
-                    table->sample_cursor = table->set.begin();
-                }
-                Entry* entry = &*table->sample_cursor;
-                // Advance before invoking the visitor, including if it throws.
-                ++table->sample_cursor;
-                invoke_accounted(entry->value, visitor, entry->key(),
-                                 static_cast<Value*>(entry->value));
-            }
-        }
-
-        maintenance_one();
-        return count;
+    // Same cursor and distinctness rules, but the visitor returns bool: true
+    // unlinks that entry as soon as the visitor returns (Entry + key freed,
+    // charge removed) and then passes its Value to disposer. Erasing visited
+    // entries never repeats or skips an unvisited entry within the same call.
+    // The visitor itself still must not structurally modify this map.
+    // disposer must be noexcept, must not reenter this map or retain its keys.
+    template <typename Visitor, typename Disposer>
+    std::size_t sample_next(std::size_t limit, Visitor&& visitor, Disposer&& disposer) {
+        static_assert(std::is_convertible_v<std::invoke_result_t<Visitor&, key_view, Value*>, bool>,
+                      "visitor must return bool: true erases the visited entry");
+        static_assert(std::is_nothrow_invocable_v<Disposer&, Value*>);
+        return sample_impl<true>(limit, visitor, disposer);
     }
 
     template <typename Visitor>
@@ -466,6 +449,72 @@ private:
         const key_view view = bytes(key.key);
         validate_key(view);
         return {view, key.hash};
+    }
+
+    template <bool kErase, typename Visitor, typename Disposer>
+    std::size_t sample_impl(std::size_t limit, Visitor& visitor, Disposer& disposer) {
+        assert(!callback_active_);
+        (void)disposer;
+        const std::size_t count = std::min(limit, size_);
+        std::size_t current_left = current_->size;
+        std::size_t old_left = old_ ? old_->size : 0;
+
+        {
+            CallbackScope scope(callback_active_);
+            for (std::size_t i = 0; i < count; ++i) {
+                Table* table;
+                if (old_left != 0 && (current_left == 0 || sample_old_next_)) {
+                    table = old_.get();
+                    --old_left;
+                    sample_old_next_ = false;
+                } else {
+                    assert(current_left != 0);
+                    table = current_.get();
+                    --current_left;
+                    sample_old_next_ = true;
+                }
+
+                if (table->sample_cursor == table->set.end()) {
+                    table->sample_cursor = table->set.begin();
+                }
+                const set_iterator it = table->sample_cursor;
+                Entry* entry = &*it;
+                // Advance before invoking the visitor, including if it throws.
+                // Erasing `it` afterwards therefore leaves the cursor alone.
+                ++table->sample_cursor;
+                if constexpr (kErase) {
+                    bool erase = false;
+                    invoke_accounted(entry->value, [&] {
+                        erase = static_cast<bool>(
+                            std::invoke(visitor, entry->key(), static_cast<Value*>(entry->value)));
+                    });
+                    if (erase) {
+                        erase_sampled(*table, it, disposer);
+                    }
+                } else {
+                    invoke_accounted(entry->value, visitor, entry->key(),
+                                     static_cast<Value*>(entry->value));
+                }
+            }
+        }
+
+        maintenance_one();
+        return count;
+    }
+
+    // Only visited entries are erased, and *_left counters already exclude
+    // them, so every remaining unvisited entry is still ahead of the cursor.
+    template <typename Disposer>
+    void erase_sampled(Table& table, set_iterator it, Disposer& disposer) noexcept {
+        Entry* entry = &*it;
+        Value* value = entry->value;
+        const std::size_t value_charge = estimate_value_bytes(value);
+        unlink_entry(table, it);
+        --size_;
+        assert(value_bytes_ >= value_charge);
+        value_bytes_ -= value_charge;
+        destroy_entry(entry);
+        std::invoke(disposer, value);
     }
 
     template <typename Mutator>

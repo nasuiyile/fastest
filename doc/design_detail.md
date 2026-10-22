@@ -41,8 +41,15 @@ value 字节从 socket 到存储只拷贝一次，之后只传递 `CacheValuePtr
   64KB 就释放。
 - 存储：所有写入都经过 `ShardCache::publish()`。它要求 value 尚未发布（引用计数为 1），把 `value->cas` 改写成新版本号
   （每分片自增，低 16 位是分片号，永不为 0；cas 命令先用期望值比较，再改写），然后插入。存进 map 的 value 字段全部是最终值。
-  `ShardCache` 使用 `IncrementalHashMap<CacheValue>`，map 中每个指针持有一次计数。插入成功后 `release_ownership()` 交给
-  map，覆盖、删除、析构时 `release()`。
+  `ShardCache` 使用 `ExpiredMap`（`src/cache/expired_map.h`，内部是 `IncrementalHashMap<CacheValue>`），map 中每个指针持有一次计数。
+  插入成功后 `release_ownership()` 交给 map，覆盖、删除、过期、析构时 `release()`。
+- 过期：判断条件为 `expired_at != 0 && expired_at <= ExpiryClock::now()`，`expired_at` 为 0 时不读时钟。发现过期就当场删除并释放，
+  不返回给调用者：get/gets/cas 的查找、delete 都会惰性删除过期的 key（cas 返回 NOT_FOUND，delete 返回 NOT_FOUND）；
+  `ShardCache::sample_expired(limit)` 供外部调度做主动过期，内部调用 `IncrementalHashMap::sample_next` 的三参数版本，
+  回调判断过期后返回 true，由 map 当场摘下节点并释放，返回本次采样数、带 TTL 数、过期删除数。
+- TTL 计数：`ExpiredMap` 用一个普通 `size_t`（分片线程私有，不用 atomic，不增加每个 pair 的内存）记录带过期时间的条目数。
+  插入带过期时间的 value 加一；这样的条目被覆盖、delete、惰性删除、采样删除时减一。计数为 0 时 `sample_expired` 直接返回，
+  不扫描、不读时钟。以后 touch/gat 原地修改 `expired_at` 必须经过 `ExpiredMap` 同步调整计数。
 - 读取：命中时 `CacheValuePtr::share()` 加一次计数放进响应，key 从命令移动进响应。value 发布后只读，跨线程共享安全；之后的覆盖或删除只释放
   map 那一次计数，在途响应继续引用旧值直到写完成。
 - 发送：编码直接输出 `view_crlf()`。超过 256 字节的 value 作为独立 iovec 直接引用 CacheValue；不超过 256 字节的拷进发送

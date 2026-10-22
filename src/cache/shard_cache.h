@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core_cache.h"
+#include "expired_map.h"
 #include "../server/comm/type.h"
 
 #include <cstdint>
@@ -13,7 +13,8 @@
 namespace fastest {
 
 // 单个分片的数据，只能由所属线程访问。
-// map_ 里每个 CacheValue* 持有一次引用计数：插入时从命令接管，覆盖/删除/析构时 release()。
+// map_（ExpiredMap）里每个 CacheValue* 持有一次引用计数：插入时从命令接管，覆盖/删除/过期/析构时 release()。
+// 读取、cas、delete 都经过惰性过期：过期的 value 按不存在处理并顺手删除；主动过期由外部调用 sample_expired()。
 // 读取只 share() 加一次计数交给响应，value 字节从解析到写出 socket 都不再复制。
 // 所有写入都经过 publish()：value 的 flags、expired_at 在解析时已经是最终值，publish() 只分配新的 cas 版本号。
 class ShardCache {
@@ -26,12 +27,8 @@ public:
 
 	ShardCache &operator=(const ShardCache &) = delete;
 
-	~ShardCache() {
-		map_.clear_and_dispose(release_value);
-	}
-
 	void erase_rejected_set(const ItemKey &key) {
-		map_.erase_and_dispose(key, release_value);
+		(void)map_.erase(key);
 	}
 
 	MultiKeyResponse handle_multi_command(MultiKeyCommand &&command) {
@@ -78,18 +75,19 @@ public:
 		return map_.used_bytes();
 	}
 
-	// 只读查看，不推进增量 rehash，不增加引用计数；返回的指针只在下一次修改 map 之前有效。
+	// 只读查看，不推进增量 rehash，不增加引用计数；已过期的返回 nullptr，但不删除。
+	// 返回的指针只在下一次修改 map 之前有效。
 	[[nodiscard]] const CacheValue *peek(const ItemKey &key) const {
 		return map_.peek(key);
 	}
 
-private:
-	static void release_value(CacheValue *value) noexcept {
-		if (value != nullptr) {
-			value->release();
-		}
+	// 主动过期采样，由所属线程的后台调度调用（见 doc/scheduled_deletion.md）：
+	// 从游标处访问最多 limit 个条目，删除其中已过期的，返回本次的统计。
+	ExpiredMap::SampleStats sample_expired(const std::size_t limit) {
+		return map_.sample_expired(limit);
 	}
 
+private:
 	// cas 版本号：每分片自增，低 16 位是分片号；从 1 开始，永远不为 0。
 	[[nodiscard]] std::uint64_t next_cas() noexcept {
 		return (++cas_sequence_ << 16) | shard_id_;
@@ -104,11 +102,7 @@ private:
 			throw std::logic_error("only an unpublished CacheValue can be stored");
 		}
 		raw->cas = next_cas();
-		const auto [previous, inserted] = map_.insert_or_assign(key, raw);
-		(void)value.release_ownership();
-		if (!inserted) {
-			release_value(previous);
-		}
+		map_.insert_or_assign(key, std::move(value));
 	}
 
 	SetResponse handle_set(SetCommand &&command) {
@@ -125,6 +119,7 @@ private:
 		}
 		// 解析时把客户端的 cas_unique 暂存在尚未发布的 value->cas 里；publish() 会改写成新版本号。
 		const std::uint64_t expected = command.value->cas;
+		// 已过期的按不存在处理（find() 顺手删除），返回 NOT_FOUND。
 		const CacheValue *const current = map_.find(command.key);
 		CasStatus status = CasStatus::Stored;
 		if (current == nullptr) {
@@ -139,7 +134,8 @@ private:
 
 	DeleteResponse handle_delete(DeleteCommand &&command) {
 		// 一次查找：摘下节点并释放 map 持有的那次计数；在途响应仍持有自己的引用，不受影响。
-		const bool found = map_.erase_and_dispose(command.key, release_value);
+		// 已过期的同样删除，但返回 NOT_FOUND。
+		const bool found = map_.erase(command.key);
 		if (command.noreply) {
 			return DeleteResponse {DeleteStatus::NoReply};
 		}
@@ -151,7 +147,7 @@ private:
 	Response handle_single_retrieval(Command &&command) {
 		using Item = typename decltype(Response::item)::value_type;
 		Response response;
-		// find() 顺带推进一步增量 rehash。
+		// find() 顺带推进一步增量 rehash；已过期的当作未命中并删除。
 		if (CacheValue *value = map_.find(command.key)) {
 			response.item.emplace(Item {std::move(command.key.key), CacheValuePtr::share(value)});
 		}
@@ -164,15 +160,17 @@ private:
 		using Item = typename decltype(Response::items)::value_type;
 		Response response;
 		response.items.reserve(command.keys.size());
+		// 整条命令共用一次时钟读取，只在碰到带过期时间的 value 时才读。
+		std::uint32_t now = 0;
 		for (ItemKey &key : command.keys) {
-			if (CacheValue *value = map_.find(key)) {
+			if (CacheValue *value = map_.find(key, now)) {
 				response.items.push_back(Item {std::move(key.key), CacheValuePtr::share(value)});
 			}
 		}
 		return response;
 	}
 
-	IncrementalHashMap<CacheValue> map_;
+	ExpiredMap map_;
 	std::uint64_t cas_sequence_ = 0;
 	std::uint16_t shard_id_ = 0;
 };
