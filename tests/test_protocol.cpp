@@ -356,17 +356,110 @@ TEST_CASE("responses that become ready during a write leave together as the next
 	const auto key = shard_key(0);
 	f.set(key, "v"); // 本分片：立即开始第一次写
 	REQUIRE(f.session().writing);
-	REQUIRE(f.session().inflight.size() == 1);
+	REQUIRE(f.session().ring_array.sent_count() == 1);
 	f.get(key);
 	f.get(key);
 	f.get(key); // 写在途：只入队，不等待
-	REQUIRE(f.session().inflight.size() == 1);
+	REQUIRE(f.session().ring_array.sent_count() == 1);
 	REQUIRE(f.session().backlog() == 3);
-	f.until([&] { return f.session().inflight.size() == 3; }); // 第一次写完成后，三条合成一次写
+	f.until([&] { return f.session().ring_array.sent_count() == 3; }); // 第一次写完成后，三条合成一次写
 	REQUIRE(f.session().backlog() == 0);
 	const std::string reply = "VALUE " + key + " 0 1\r\nv\r\nEND\r\n";
 	REQUIRE(f.read(8 + 3 * reply.size()) == "STORED\r\n" + reply + reply + reply);
 	f.until([&] { return !f.session().writing; });
+	REQUIRE(f.session().ring_array.sent_count() == 0); // 写完成后释放已发送槽位
+}
+
+TEST_CASE("RingArray keeps sent slots until release and drops their late replies", "[ring]") {
+	const auto error = [](uint32_t seq, ResponseErrorKind kind) {
+		ErrorResponse response;
+		response.kind = kind;
+		return ResponseMessage {.tcp_id = 1, .seq = seq, .shard_id = 0, .data = response};
+	};
+	RingArray ring(4);
+	ring.append(error(0, ResponseErrorKind::Error));
+	ring.append(error(1, ResponseErrorKind::Error));
+	REQUIRE(ring.front()->seq == 0);
+	ring.advance();
+	REQUIRE(ring.front()->seq == 1);
+	ring.advance();
+	REQUIRE(ring.front() == nullptr);
+	REQUIRE(ring.next_id() == 2);
+	REQUIRE(ring.sent_count() == 2);
+
+	// 已发送的序号再来一条：丢弃，不改写在途槽位。
+	ring.append(error(0, ResponseErrorKind::ServerError));
+	REQUIRE(std::get<ErrorResponse>(ring.get(0)->data).kind == ResponseErrorKind::Error);
+
+	// 扩容要算上在途槽位：head 仍是 0。
+	for (uint32_t seq = 2; seq != 10; ++seq) {
+		ring.append(error(seq, ResponseErrorKind::Error));
+	}
+	REQUIRE(ring.capacity() == 16);
+	REQUIRE(ring.get(0)->seq == 0);
+	REQUIRE(ring.get(1)->seq == 1);
+	REQUIRE(ring.sent_count() == 2);
+
+	ring.release_sent();
+	REQUIRE(ring.get(0) == nullptr);
+	REQUIRE(ring.get(1) == nullptr);
+	REQUIRE(ring.sent_count() == 0);
+	REQUIRE(ring.front()->seq == 2);
+}
+
+TEST_CASE("multi-key parts encode in arrival order with one END and no merge", "[protocol]") {
+	std::vector<ShardResponse> parts;
+	parts.push_back(ShardResponse {
+	    .count = 2, .command = MultiKeyResponse {MultiGetResponse {.items = {ValueItem {"a", CacheValue::create("A", 1)}}}}});
+	parts.push_back(ShardResponse {.count = 2,
+	                               .command = MultiKeyResponse {MultiGetResponse {
+	                                   .items = {ValueItem {"b", CacheValue::create("B", 2)},
+	                                             ValueItem {"c", CacheValue::create("C", 3)}}}}});
+	const auto project = [](const ShardResponse &part) -> const MultiKeyResponse & {
+		return part.command;
+	};
+	std::string wire;
+	detail::StringSink sink {wire};
+	REQUIRE_FALSE(encode_multi_parts(sink, parts, project));
+	REQUIRE(wire == "VALUE a 1 1\r\nA\r\nVALUE b 2 1\r\nB\r\nVALUE c 3 1\r\nC\r\nEND\r\n");
+
+	parts.push_back(ShardResponse {.count = 2, .command = MultiKeyResponse {MultiGetsResponse {}}});
+	REQUIRE_THROWS_AS(encode_multi_parts(sink, parts, project), std::logic_error);
+	REQUIRE_THROWS_AS(encode_multi_parts(sink, std::vector<ShardResponse> {}, project), std::invalid_argument);
+}
+
+TEST_CASE("sent slots stay valid while the ring grows under a blocked write", "[protocol]") {
+	WorkerFixture f;
+	const auto big = shard_keys(0, 2)[0];
+	const auto small = shard_keys(0, 2)[1];
+	const std::string value(64 * 1024, 'x'); // > kInlineBytes：GatherSink 只引用，不拷贝
+	f.set(big, value);
+	f.set(small, "s");
+	REQUIRE(f.read(16) == "STORED\r\nSTORED\r\n");
+	f.until([&] { return !f.session().writing; });
+
+	// 收发缓冲调到很小，让下面这次写只能发出一部分，保持在途。
+	f.session().socket.set_option(asio::socket_base::send_buffer_size(4096));
+	f.client.set_option(asio::socket_base::receive_buffer_size(4096));
+	f.get(big);
+	REQUIRE(f.session().writing);
+	REQUIRE(f.session().ring_array.sent_count() == 1);
+	const auto initial_capacity = f.session().ring_array.capacity();
+	constexpr int kQueued = 300;
+	for (int i = 0; i != kQueued; ++i) {
+		f.get(small); // 写在途：只入队；超过初始容量时环扩容，搬动在途槽位
+	}
+	REQUIRE(f.session().ring_array.capacity() > initial_capacity);
+	REQUIRE(f.session().ring_array.sent_count() == 1);
+
+	std::string expected = "VALUE " + big + " 0 " + std::to_string(value.size()) + "\r\n" + value + "\r\nEND\r\n";
+	const std::string reply = "VALUE " + small + " 0 1\r\ns\r\nEND\r\n";
+	for (int i = 0; i != kQueued; ++i) {
+		expected += reply;
+	}
+	REQUIRE(f.read(expected.size()) == expected);
+	f.until([&] { return !f.session().writing; });
+	REQUIRE(f.session().ring_array.sent_count() == 0);
 }
 
 TEST_CASE("the parser copies a value once into its final CacheValue", "[cache_value]") {

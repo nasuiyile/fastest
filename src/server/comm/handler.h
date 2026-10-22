@@ -171,7 +171,7 @@ private:
 		// A fatal parse error may still have earlier cross-shard responses in the
 		// ring. Keep the session object until the ordered writer closes it.
 		tcp_session.session_exited = true;
-		// 有写在途时不能回收（inflight 还被引用），由写回调结束时回收。
+		// 有写在途时不能回收（ring_array 的已发送槽位还被引用），由写回调结束时回收。
 		worker_.reclaim_session_if_idle(tcp_id, tcp_session);
 	}
 

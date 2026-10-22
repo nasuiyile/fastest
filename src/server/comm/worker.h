@@ -28,13 +28,12 @@ struct TCPSession {
 	static constexpr uint32_t kResumeReadBacklog = 256;
 
 	// 注意：resume_read 的初始化依赖 socket，socket 必须声明在 resume_read 之前；
-	//      out 引用 inflight 中的数据，inflight 需声明在 out 之前（析构时 out 先于 inflight 销毁）。
+	//      out 引用 ring_array 已发送槽位里的数据，ring_array 需声明在 out 之前（析构时 out 先于 ring_array 销毁）。
 
 	tcp::socket socket;
 	asio::steady_timer resume_read; // 背压：当条件变量用，永不到期，cancel() 唤醒
-	RingArray ring_array;
-	std::vector<ResponseMessage> inflight; // 写路径：在途写引用的响应，写完成前不能释放
-	GatherSink out;                        // 写路径：在途写的 buffer 描述和短字段 arena
+	RingArray ring_array;           // 有序响应；[head, next_id) 同时是在途写引用的响应，写完成前不能释放
+	GatherSink out;                 // 写路径：在途写的 buffer 描述和短字段 arena
 
 	uint32_t seq {0};
 	std::optional<uint32_t> swallow_seq; // 数据块丢弃完成前，不能发出该序号的错误
@@ -53,12 +52,10 @@ struct TCPSession {
 		return seq - ring_array.next_id(); // 序号允许回绕，无符号减法即可
 	}
 
-	void release_inflight() noexcept {
-		inflight.clear();
+	// 写完成（或放弃这次写）后调用：先丢掉对槽位的引用，再释放已发送的槽位。
+	void release_sent() noexcept {
 		out.clear();
-		if (inflight.capacity() > 256) {
-			std::vector<ResponseMessage>().swap(inflight);
-		}
+		ring_array.release_sent();
 	}
 };
 
@@ -361,33 +358,34 @@ private:
 		}
 		bool close_after = false;
 		try {
-			while (session.out.size_bytes() < kMaxBatchBytes && session.inflight.size() < kMaxBatchResponses) {
+			while (session.out.size_bytes() < kMaxBatchBytes &&
+			       session.ring_array.sent_count() < kMaxBatchResponses) {
 				// memcached queues an oversized object's error while swallowing its
 				// data block. Earlier ready responses may still leave in order.
 				if (session.swallow_seq && *session.swallow_seq == session.ring_array.next_id()) {
 					break;
 				}
-				auto popped = session.ring_array.try_pop();
-				if (!popped) {
+				// 直接从槽位编码，不搬出：编码引用的数据留在槽里，写完成后 release_sent() 才释放。
+				const RingResponseMessage *message = session.ring_array.front();
+				if (!message) {
 					break;
 				}
-				// 先放进 inflight 再编码：编码引用的是 inflight 里的字符串，它们要活到这次写完成。
-				const ResponseMessage &message = session.inflight.emplace_back(std::move(*popped));
-				close_after = encode_response(session.out, message.data);
+				close_after = encode_response(session.out, message->data);
+				session.ring_array.advance();
 				if (close_after) {
 					break; // Quit / 致命错误：之后的响应不再发送
 				}
 			}
 		} catch (const std::exception &e) {
 			spdlog::error("[shard {}] response batch failed: {}", current_shard_id(), e.what());
-			session.release_inflight();
+			session.release_sent();
 			close_session(tcp_id, session);
 			return;
 		}
 
 		if (session.out.empty()) {
 			// 没有就绪的响应，或者本批只有 noreply 这类不产生字节的响应。
-			session.release_inflight();
+			session.release_sent();
 			if (close_after) {
 				close_session(tcp_id, session);
 				return;
@@ -413,7 +411,7 @@ private:
 		}
 		TCPSession &session = *it->second;
 		session.writing = false;
-		session.release_inflight();
+		session.release_sent();
 		if (ec) {
 			if (ec != asio::error::broken_pipe && ec != asio::error::connection_reset && ec != asio::error::eof &&
 			    ec != asio::error::bad_descriptor && ec != asio::error::operation_aborted) {
@@ -430,14 +428,17 @@ private:
 	}
 
 	// 编码一条响应；字段非法时撤销这条已追加的部分，改发 SERVER_ERROR 占住这个 seq。
-	bool encode_response(GatherSink &out, const ResponseData &data) const {
+	bool encode_response(GatherSink &out, const RingResponseData &data) const {
 		const GatherSink::Mark mark = out.mark();
 		try {
 			return std::visit(
 			    [&out](const auto &value) -> bool {
 				    using T = std::remove_cvref_t<decltype(value)>;
-				    if constexpr (std::is_same_v<T, ShardResponse>) {
-					    return encode_to(out, value.command);
+				    if constexpr (std::is_same_v<T, std::vector<ShardResponse>>) {
+					    // 多分片：按到达顺序依次输出各分片的 items，不先合并。
+					    return encode_multi_parts(out, value, [](const ShardResponse &part) -> const MultiKeyResponse & {
+						    return part.command;
+					    });
 				    } else {
 					    return encode_to(out, value);
 				    }
@@ -467,7 +468,7 @@ private:
 			session.socket.close(ec);     // 唤醒 session() 中的 async_read_some，并取消在途写
 			session.resume_read.cancel(); // 唤醒因背压暂停的读协程
 		}
-		// 写在途时不回收：取消也会回调 on_write_complete，届时再回收；在那之前 inflight 仍可能被引用。
+		// 写在途时不回收：取消也会回调 on_write_complete，届时再回收；在那之前 ring_array 的已发送槽位仍可能被引用。
 		reclaim_session_if_idle(tcp_id, session);
 	}
 

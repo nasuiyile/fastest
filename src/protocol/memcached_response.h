@@ -762,6 +762,33 @@ bool encode_to(Sink &out, const Response &response) {
 	return detail::emit_one(out, response);
 }
 
+// 一条 multi-key 请求拆到多个分片后的各部分：按 parts 的顺序输出每部分的 items，最后只写一个 END。
+// 输出等同于先把 items 合并成一个 MultiKeyResponse 再 encode_to，但不移动条目、不分配内存。
+// project(part) 返回 const MultiKeyResponse&；各部分必须是同一种响应类型。
+template <typename Sink, typename Parts, typename Project>
+bool encode_multi_parts(Sink &out, const Parts &parts, Project project) {
+	if (parts.empty()) {
+		throw std::invalid_argument("multi-key response without parts");
+	}
+	return std::visit(
+	    [&](const auto &first) -> bool {
+		    using T = std::remove_cvref_t<decltype(first)>;
+		    static_assert(detail::IsMultiRetrievalResponse<T>::value, "multi-key parts must be retrieval responses");
+		    for (const auto &part : parts) {
+			    const auto *value = std::get_if<T>(&project(part).variant());
+			    if (!value) {
+				    throw std::logic_error("Inconsistent multi-key response type");
+			    }
+			    for (const auto &item : value->items) {
+				    detail::emit_retrieval_item(out, item);
+			    }
+		    }
+		    out.append("END\r\n");
+		    return false;
+	    },
+	    project(*parts.begin()).variant());
+}
+
 struct EncodedResponseBatch {
 	std::string bytes;
 	// 已处理的响应对象数，包含 NoReply 和 Quit。

@@ -5,17 +5,21 @@
 读和写互不等待。session 协程只负责读、解析和执行；响应进入连接的环形数组后调用 `kick_write`，不等待 socket。
 mailbox 收到跨分片响应也一样只入队，因此一个不读响应的慢连接不会拖住同分片的其他连接。
 
-每个连接同一时刻最多一个 `async_write` 在途（`TCPSession::writing`）。`kick_write` 按序号取出环形数组中所有就绪的响应，
+每个连接同一时刻最多一个 `async_write` 在途（`TCPSession::writing`）。`kick_write` 按序号在环形数组里原地编码所有就绪的响应（不搬出槽位，只推进发送游标），
 用 `GatherSink` 同步编码成 `const_buffer` 列表，一次 `async_write`（writev）发出：协议文本、数字和不超过 256 字节的字段
 拷进连续的 arena 并合并成一段，更长的 value 只引用不复制。写在途期间新就绪的响应留在环形数组，由写完成回调作为下一批发出，
 流水线请求因此自然合并成少量系统调用。每批最多 1MB 或 256 条响应。
+
+环形数组兼作在途缓冲，有两个游标：`[head, next_id)` 已编码进在途写，写完成后 `release_sent()` 一次释放；
+`next_id` 之后等待发送。容量从 `head` 算起，扩容会移动在途槽位：这依赖 `GatherSink` 只引用槽位之外的内存
+（`CacheValue` 的 payload），key 和短字段都拷进 arena。多分片响应不合并，编码时按到达顺序依次输出各分片的条目，最后一个 `END`。
 
 编码在写之前完成：某条响应字段非法时，撤销它已追加的部分，改发 `SERVER_ERROR` 占住这个序号，不会发出半个响应。
 
 背压：已分配序号、但还没交给写操作的请求数（`TCPSession::backlog()`）达到 1024 时，session 协程暂停解析和读取，
 等写回调把它降到 256 以下再恢复。丢弃过大数据块的路径不受影响，否则 swallow 永远无法完成。
 
-回收：写在途时不能回收 session，asio 和内核仍引用 `inflight` 中的响应。session 协程退出或连接关闭时如果仍有写在途，
+回收：写在途时不能回收 session，asio 和内核仍引用环形数组中已发送的槽位。session 协程退出或连接关闭时如果仍有写在途，
 由写完成回调回收（`reclaim_session_if_idle`），取消的写同样会回调。
 
 ## Value 的生命周期
