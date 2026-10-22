@@ -4,12 +4,18 @@
 #include "server/comm/input_buffer.h"
 #include "server/comm/worker.h"
 
+#include <poll.h>
+
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -94,8 +100,7 @@ struct WorkerFixture {
 
 	void start_mailboxes() {
 		for (auto &worker : workers) {
-			asio::co_spawn(io, worker.mailbox_request_loop(), asio::detached);
-			asio::co_spawn(io, worker.mailbox_response_loop(), asio::detached);
+			asio::co_spawn(io, worker.mailbox_loop(), asio::detached);
 		}
 	}
 
@@ -132,12 +137,25 @@ struct WorkerFixture {
 		return result;
 	}
 
+	// 和 Handler::session 一样，跨分片发送和响应入环都放在 BatchScope 里，离开时敲门、发起写。
 	void set(const std::string &key, std::string_view value) {
+		Worker::BatchScope scope(workers[0]);
 		workers[0].send_single_command(SingleKeyCommand(SetCommand {ItemKey(key), CacheValue::create(value)}), id);
 	}
 
 	void get(const std::string &key) {
+		Worker::BatchScope scope(workers[0]);
+		queue_get(key);
+	}
+
+	// 只入队、不敲门、不发起写：放在测试自己开的 BatchScope 里用。
+	void queue_get(const std::string &key) {
 		workers[0].send_single_command(SingleKeyCommand(SingleGetCommand {ItemKey(key)}), id);
+	}
+
+	void error(const ErrorResponse &response) {
+		Worker::BatchScope scope(workers[0]);
+		workers[0].send_error_command(response, id);
 	}
 };
 }
@@ -229,8 +247,11 @@ TEST_CASE("delayed remote payload survives input reuse and errors retain wire or
 	const std::string value(2048, 'v');
 	std::string input = "set " + key + " 0 0 2048\r\n" + value + "\r\nbogus\r\n";
 	auto batch = parse(input);
-	f.workers[0].send_single_command(std::move(std::get<SingleKeyCommand>(batch.commands[0])), f.id);
-	f.workers[0].send_error_command(to_error_response(*batch.error), f.id);
+	{
+		Worker::BatchScope scope(f.workers[0]);
+		f.workers[0].send_single_command(std::move(std::get<SingleKeyCommand>(batch.commands[0])), f.id);
+		f.workers[0].send_error_command(to_error_response(*batch.error), f.id);
+	}
 	input.assign(input.size(), '!'); // remote mailbox has not consumed the value
 	batch.commands.clear();
 	f.get(key);
@@ -245,7 +266,7 @@ TEST_CASE("delayed remote payload survives input reuse and errors retain wire or
 TEST_CASE("fatal errors drain earlier remote replies before closing and reclaiming the session", "[protocol]") {
 	WorkerFixture f;
 	f.get(shard_key(1));
-	f.workers[0].send_error_command(ErrorResponse {ResponseErrorKind::ClientError, "command line too long", true}, f.id);
+	f.error(ErrorResponse {ResponseErrorKind::ClientError, "command line too long", true});
 	f.session().protocol_error_waiting = true;
 	f.session().session_exited = true;
 	REQUIRE_FALSE(f.session().closing);
@@ -263,7 +284,7 @@ TEST_CASE("fatal errors drain earlier remote replies before closing and reclaimi
 TEST_CASE("suppressed errors still advance the response sequence", "[protocol]") {
 	WorkerFixture f;
 	f.get(shard_key(1));
-	f.workers[0].send_error_command(ErrorResponse {ResponseErrorKind::ClientError, "bad data chunk", false, true}, f.id);
+	f.error(ErrorResponse {ResponseErrorKind::ClientError, "bad data chunk", false, true});
 	f.get(shard_key(0));
 	f.start_mailboxes();
 	REQUIRE(f.read(10) == "END\r\nEND\r\n");
@@ -279,8 +300,11 @@ TEST_CASE("oversized SET removes old values in the same shard order as successfu
 		ParserLimits limits;
 		limits.max_value_bytes = 4;
 		auto rejected = parse("set " + key + " 0 0 20\r\n", limits);
-		f.workers[0].send_error_command(to_error_response(*rejected.error), f.id,
-		                                std::move(rejected.error->rejected_set_key), true);
+		{
+			Worker::BatchScope scope(f.workers[0]);
+			f.workers[0].send_error_command(to_error_response(*rejected.error), f.id,
+			                                std::move(rejected.error->rejected_set_key), true);
+		}
 		f.get(key);
 		f.start_mailboxes();
 		f.until([&] { return f.session().ring_array.get(2) != nullptr; });
@@ -299,8 +323,11 @@ TEST_CASE("multi-get waits for all shards before a subsequent parse error", "[pr
 	const auto remote = shard_key(1);
 	f.set(local, "L");
 	f.set(remote, "R");
-	f.workers[0].send_multi_command(MultiKeyCommand(MultiGetCommand {{ItemKey(local), ItemKey(remote)}}), f.id);
-	f.workers[0].send_error_command(ErrorResponse {}, f.id);
+	{
+		Worker::BatchScope scope(f.workers[0]);
+		f.workers[0].send_multi_command(MultiKeyCommand(MultiGetCommand {{ItemKey(local), ItemKey(remote)}}), f.id);
+		f.workers[0].send_error_command(ErrorResponse {}, f.id);
+	}
 	REQUIRE(f.session().ring_array.next_id() == 1);
 	REQUIRE_FALSE(f.session().ring_array.is_ready());
 	f.start_mailboxes();
@@ -368,6 +395,68 @@ TEST_CASE("responses that become ready during a write leave together as the next
 	REQUIRE(f.read(8 + 3 * reply.size()) == "STORED\r\n" + reply + reply + reply);
 	f.until([&] { return !f.session().writing; });
 	REQUIRE(f.session().ring_array.sent_count() == 0); // 写完成后释放已发送槽位
+}
+
+TEST_CASE("replies produced in one batch leave in a single write", "[protocol]") {
+	WorkerFixture f;
+	auto &worker = f.workers[0];
+	const auto key = shard_key(0);
+	constexpr int kGets = 10;
+	{
+		Worker::BatchScope scope(worker);
+		for (int i = 0; i != kGets; ++i) {
+			f.queue_get(key); // 本分片：立即执行并入环，但不在这里发起写
+		}
+		REQUIRE_FALSE(f.session().writing);
+		REQUIRE(f.session().ring_array.next_id() == 0);
+		REQUIRE(worker.socket_writes() == 0);
+	}
+	REQUIRE(f.session().writing); // 离开作用域：一次写带上全部响应
+	REQUIRE(f.session().ring_array.sent_count() == kGets);
+	REQUIRE(worker.socket_writes() == 1);
+	std::string expected;
+	for (int i = 0; i != kGets; ++i) {
+		expected += "END\r\n";
+	}
+	REQUIRE(f.read(expected.size()) == expected);
+	f.until([&] { return !f.session().writing; });
+	REQUIRE(worker.socket_writes() == 1);
+}
+
+TEST_CASE("remote replies drained in one mailbox round leave in a single write", "[protocol]") {
+	WorkerFixture f;
+	auto &worker = f.workers[0];
+	const auto remote = shard_key(1);
+	constexpr int kGets = 10;
+	{
+		Worker::BatchScope scope(worker);
+		for (int i = 0; i != kGets; ++i) {
+			f.queue_get(remote);
+		}
+	}
+	REQUIRE(worker.socket_writes() == 0); // 全部在等远端，没有可写的
+	f.start_mailboxes();
+	std::string expected;
+	for (int i = 0; i != kGets; ++i) {
+		expected += "END\r\n";
+	}
+	REQUIRE(f.read(expected.size()) == expected);
+	REQUIRE(worker.socket_writes() == 1); // 10 条响应在收件协程的同一轮到达，一次写发出
+}
+
+TEST_CASE("a session waiting for its batched write is reclaimed only after the write", "[protocol]") {
+	WorkerFixture f;
+	auto &worker = f.workers[0];
+	{
+		Worker::BatchScope scope(worker);
+		f.queue_get(shard_key(0)); // 入环，等作用域结束再写
+		REQUIRE(f.session().kick_pending);
+		f.session().session_exited = true;
+		worker.reclaim_session_if_idle(f.id, f.session());
+		REQUIRE(worker.tcp_session_.contains(f.id)); // 还在待写列表里：不能回收
+	}
+	REQUIRE(f.read(5) == "END\r\n");
+	f.until([&] { return !worker.tcp_session_.contains(f.id); }); // 写完成后由写回调回收
 }
 
 TEST_CASE("RingArray keeps sent slots until release and drops their late replies", "[ring]") {
@@ -629,7 +718,10 @@ TEST_CASE("multi-get whose keys share one remote shard is forwarded whole", "[ca
 	const auto keys = shard_keys(1, 2);
 	f.set(keys[0], "first");
 	f.set(keys[1], "second");
-	f.workers[0].send_multi_command(MultiKeyCommand(MultiGetCommand {{ItemKey(keys[0]), ItemKey(keys[1])}}), f.id);
+	{
+		Worker::BatchScope scope(f.workers[0]);
+		f.workers[0].send_multi_command(MultiKeyCommand(MultiGetCommand {{ItemKey(keys[0]), ItemKey(keys[1])}}), f.id);
+	}
 	f.start_mailboxes();
 	const std::string expected = "STORED\r\nSTORED\r\nVALUE " + keys[0] + " 0 5\r\nfirst\r\nVALUE " + keys[1] +
 	                             " 0 6\r\nsecond\r\nEND\r\n";
@@ -1257,8 +1349,11 @@ TEST_CASE("gat across shards touches each key on its own shard", "[protocol]") {
 	f.set(remote, "R");
 	auto batch = parse("gat -1 " + local + " " + remote + "\r\ngat 100\r\n");
 	REQUIRE(batch.commands.size() == 2);
-	for (auto &command : batch.commands) {
-		f.workers[0].send_multi_command(std::move(std::get<MultiKeyCommand>(command)), f.id);
+	{
+		Worker::BatchScope scope(f.workers[0]);
+		for (auto &command : batch.commands) {
+			f.workers[0].send_multi_command(std::move(std::get<MultiKeyCommand>(command)), f.id);
+		}
 	}
 	f.get(local);
 	f.get(remote);
@@ -1266,4 +1361,271 @@ TEST_CASE("gat across shards touches each key on its own shard", "[protocol]") {
 	const std::string expected = "STORED\r\nSTORED\r\nVALUE " + local + " 0 1\r\nL\r\nVALUE " + remote +
 	                             " 0 1\r\nR\r\nEND\r\nEND\r\nEND\r\nEND\r\n";
 	REQUIRE(f.read(expected.size()) == expected);
+}
+
+namespace {
+// eventfd 的计数（不消费）：可读就说明有过敲门还没被消费者清掉。
+bool doorbell_pending(const int fd) {
+	pollfd pfd {fd, POLLIN, 0};
+	return ::poll(&pfd, 1, 0) == 1;
+}
+
+void drain_eventfd(const int fd) {
+	uint64_t value = 0;
+	REQUIRE(::read(fd, &value, sizeof(value)) == sizeof(value));
+}
+} // namespace
+
+TEST_CASE("a doorbell writes its eventfd once until the consumer lowers it", "[doorbell]") {
+	Doorbell bell;
+	const int fd = bell.duplicate_event_fd();
+	REQUIRE(fd >= 0);
+	REQUIRE_FALSE(bell.is_rung()); // 初始：消费者还没醒，第一个生产者负责敲门
+
+	REQUIRE(bell.ring());
+	REQUIRE(bell.is_rung());
+	REQUIRE(doorbell_pending(fd));
+	REQUIRE_FALSE(bell.ring()); // 已有人敲过：只读一下标志
+	REQUIRE_FALSE(bell.ring());
+	drain_eventfd(fd); // 消费者醒来，先清 fd；门铃仍抬起，生产者继续不敲
+	REQUIRE_FALSE(bell.ring());
+	REQUIRE_FALSE(doorbell_pending(fd));
+
+	bell.lower(); // 准备睡：之后的第一次 ring 要写 fd
+	REQUIRE(bell.ring());
+	REQUIRE(doorbell_pending(fd));
+	drain_eventfd(fd);
+
+	bell.lower();
+	bell.raise(); // 复查发现了消息，继续醒着：仍不需要敲
+	REQUIRE_FALSE(bell.ring());
+	REQUIRE_FALSE(doorbell_pending(fd));
+	::close(fd);
+}
+
+TEST_CASE("concurrent producers never lose a doorbell wakeup", "[doorbell]") {
+	// 消费者按 Worker::mailbox_loop 的协议运行：醒着时不放门铃；一轮为空才 lower()，复查仍为空才在 fd 上睡。
+	// 生产者每批 1~8 条、批间随机停顿，让消费者在醒着、准备睡、睡着之间来回切换。
+	// 丢一次唤醒，最后剩下的消息就没人敲门，poll 超时。
+	constexpr int kProducers = 3;
+	constexpr uint64_t kPerProducer = 100000;
+	constexpr uint64_t kTotal = kProducers * kPerProducer;
+	Doorbell bell;
+	Mailbox<uint64_t> requests;
+	Mailbox<uint64_t> responses;
+	std::atomic<uint64_t> knocks {0};
+	std::atomic<bool> push_failed {false};
+
+	std::vector<std::thread> producers;
+	for (int p = 0; p < kProducers; ++p) {
+		producers.emplace_back([&, p] {
+			std::minstd_rand rng(static_cast<unsigned>(p + 1));
+			uint64_t sent = 0;
+			uint64_t local_knocks = 0;
+			while (sent < kPerProducer) {
+				const uint64_t batch = std::min<uint64_t>(1 + rng() % 8, kPerProducer - sent);
+				for (uint64_t i = 0; i < batch; ++i, ++sent) {
+					auto message = std::make_unique<uint64_t>(sent);
+					if (!((sent & 1) != 0 ? requests : responses).try_push(message)) {
+						push_failed = true;
+					}
+				}
+				local_knocks += bell.ring();
+				for (unsigned spin = rng() % 16384; spin != 0; --spin) {
+					asm volatile("" ::: "memory");
+				}
+			}
+			knocks += local_knocks;
+		});
+	}
+
+	const int fd = bell.duplicate_event_fd();
+	REQUIRE(fd >= 0);
+	uint64_t received = 0;
+	uint64_t lowers = 0;
+	uint64_t sleeps = 0;
+	bool lost_wakeup = false;
+	const auto drain = [&] {
+		std::size_t n = 0;
+		std::unique_ptr<uint64_t> message;
+		while (requests.pop(message)) {
+			++n;
+		}
+		while (responses.pop(message)) {
+			++n;
+		}
+		received += n;
+		return n;
+	};
+	while (received < kTotal) {
+		if (drain() != 0) {
+			continue; // 醒着：门铃保持抬起
+		}
+		bell.lower();
+		++lowers;
+		if (drain() != 0) {
+			bell.raise();
+			continue;
+		}
+		++sleeps;
+		pollfd pfd {fd, POLLIN, 0};
+		if (::poll(&pfd, 1, 5000) != 1) {
+			lost_wakeup = true;
+			break;
+		}
+		drain_eventfd(fd);
+	}
+	for (auto &producer : producers) {
+		producer.join();
+	}
+	::close(fd);
+	REQUIRE_FALSE(push_failed);
+	REQUIRE_FALSE(lost_wakeup);
+	REQUIRE(received == kTotal);
+	// 每次放下门铃（加上初始的放下状态）最多换来一次 eventfd 写入。
+	REQUIRE(knocks.load() <= lowers + 1);
+	REQUIRE(sleeps <= lowers);
+	WARN("doorbell stress: " << kTotal << " messages, " << knocks.load() << " eventfd writes, " << sleeps
+	                         << " sleeps, " << lowers << " lowers");
+}
+
+TEST_CASE("a producer that waits for every reply wakes the sleeping consumer every time", "[doorbell]") {
+	// 乒乓：每条消息都要等消费者处理完才发下一条，消费者几乎每条都要经历「放下门铃 → 复查 → 睡 → 被敲醒」，
+	// 反复穿过最容易丢唤醒的窗口。丢一次就会卡住，poll 超时。
+	constexpr uint64_t kRoundTrips = 20000;
+	Doorbell bell;
+	Mailbox<uint64_t> requests;
+	std::atomic<uint64_t> received {0};
+	std::atomic<bool> lost_wakeup {false};
+	uint64_t knocks = 0;
+	std::thread consumer([&] {
+		const int fd = bell.duplicate_event_fd();
+		uint64_t local = 0;
+		const auto drain = [&] {
+			std::size_t n = 0;
+			std::unique_ptr<uint64_t> message;
+			while (requests.pop(message)) {
+				++n;
+			}
+			local += n;
+			received.store(local, std::memory_order_release);
+			return n;
+		};
+		while (local < kRoundTrips) {
+			if (drain() != 0) {
+				continue;
+			}
+			bell.lower();
+			if (drain() != 0) {
+				bell.raise();
+				continue;
+			}
+			pollfd pfd {fd, POLLIN, 0};
+			if (::poll(&pfd, 1, 5000) != 1) {
+				lost_wakeup = true;
+				break;
+			}
+			uint64_t value = 0;
+			[[maybe_unused]] const auto n = ::read(fd, &value, sizeof(value));
+		}
+		::close(fd);
+	});
+	for (uint64_t i = 0; i < kRoundTrips && !lost_wakeup; ++i) {
+		auto message = std::make_unique<uint64_t>(i);
+		REQUIRE(requests.try_push(message));
+		knocks += bell.ring();
+		while (received.load(std::memory_order_acquire) <= i && !lost_wakeup) {
+		}
+	}
+	consumer.join();
+	REQUIRE_FALSE(lost_wakeup);
+	REQUIRE(received.load() == kRoundTrips);
+	REQUIRE(knocks <= kRoundTrips);
+	WARN("doorbell ping-pong: " << kRoundTrips << " messages, " << knocks << " eventfd writes");
+}
+
+TEST_CASE("a batch rings each remote shard once and flushes every 64 messages", "[doorbell]") {
+	WorkerFixture f; // 收件协程没启动：门铃只由测试放下
+	Worker &w = f.workers[0];
+	Doorbell &remote_bell = w.doorbell(1);
+	const auto remote = shard_key(1);
+	const int fd = remote_bell.duplicate_event_fd();
+	REQUIRE(fd >= 0);
+
+	{
+		Worker::BatchScope batch(w);
+		for (int i = 0; i != 10; ++i) {
+			f.queue_get(remote);
+		}
+		REQUIRE(w.doorbell_knocks() == 0); // 只记下目标分片
+		REQUIRE_FALSE(doorbell_pending(fd));
+	}
+	REQUIRE(w.doorbell_knocks() == 1); // 离开作用域：10 条只敲一次
+	drain_eventfd(fd);
+
+	remote_bell.lower();
+	{
+		Worker::BatchScope batch(w);
+		for (int i = 0; i != 63; ++i) {
+			f.queue_get(remote);
+		}
+		REQUIRE(w.doorbell_knocks() == 1);
+		f.queue_get(remote); // 第 64 条：先把攒下的敲出去，不等作用域结束
+		REQUIRE(w.doorbell_knocks() == 2);
+		drain_eventfd(fd);
+		remote_bell.lower();
+		f.queue_get(remote);
+		REQUIRE(w.doorbell_knocks() == 2);
+	}
+	REQUIRE(w.doorbell_knocks() == 3);
+	drain_eventfd(fd);
+
+	// 门铃已抬起（对端还没处理）：再来一批也不写 fd。
+	{
+		Worker::BatchScope batch(w);
+		f.queue_get(remote);
+		f.queue_get(remote);
+	}
+	REQUIRE(w.doorbell_knocks() == 3);
+	REQUIRE_FALSE(doorbell_pending(fd));
+	::close(fd);
+
+	// 一共 10 + 65 + 2 条请求都在对端 mailbox 里：交给收件协程，响应全部按序到达。
+	f.start_mailboxes();
+	std::string expected;
+	for (int i = 0; i != 77; ++i) {
+		expected += "END\r\n";
+	}
+	REQUIRE(f.read(expected.size()) == expected);
+}
+
+TEST_CASE("an awake mailbox keeps its doorbell up and an idle one sleeps with it lowered", "[doorbell]") {
+	WorkerFixture f;
+	Worker &local = f.workers[0];
+	Worker &remote = f.workers[1];
+	Doorbell &remote_bell = local.doorbell(1);
+	const auto key = shard_key(1);
+	f.set(key, "v");
+	f.start_mailboxes();
+	REQUIRE(f.read(8) == "STORED\r\n");
+	f.until([&] { return remote.mailbox_sleeps() >= 1 && !remote_bell.is_rung(); }); // 空闲：门铃放下，睡在 fd 上
+
+	const uint64_t knocks = local.doorbell_knocks();
+	const uint64_t handled = remote.mailbox_messages();
+	f.get(key);
+	REQUIRE(local.doorbell_knocks() == knocks + 1); // 对端在睡：敲一次
+	f.until([&] { return remote.mailbox_messages() == handled + 1; });
+	// 对端刚处理完一条、让出了 CPU，还醒着：门铃保持抬起，再发不用敲。
+	REQUIRE(remote_bell.is_rung());
+	const uint64_t sleeps = remote.mailbox_sleeps();
+	f.get(key);
+	f.get(key);
+	REQUIRE(local.doorbell_knocks() == knocks + 1);
+
+	const std::string reply = "VALUE " + key + " 0 1\r\nv\r\nEND\r\n";
+	REQUIRE(f.read(3 * reply.size()) == reply + reply + reply);
+	f.until([&] { return remote.mailbox_sleeps() > sleeps && !remote_bell.is_rung(); }); // 流量停了：又去睡
+	f.get(key);
+	REQUIRE(local.doorbell_knocks() == knocks + 2);
+	REQUIRE(f.read(reply.size()) == reply);
 }

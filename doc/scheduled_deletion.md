@@ -18,8 +18,7 @@ LRU，LFU如果达到了上限，那么直接由本次写入这个key的协程�
 优先级调度代码
 ~~~C++
 void run() {
-    asio::co_spawn(io_, worker_->mailbox_request_loop(), asio::detached);
-    asio::co_spawn(io_, worker_->mailbox_response_loop(), asio::detached);
+    asio::co_spawn(io_, worker_->mailbox_loop(), asio::detached);
     asio::co_spawn(io_, accept_loop(), asio::detached);
     while (!stop_->load(std::memory_order_relaxed) && !io_.stopped()) {
         // 前台优先。

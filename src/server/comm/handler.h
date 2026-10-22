@@ -115,11 +115,15 @@ private:
 				}
 
 				auto result = parser.parse(input.readable(), 128);
-				// 先执行成功解析的命令，确保响应顺序正确
-				execute_batch(result.commands, tcp_id);
 				bool keep_connection = true;
-				if (result.stop == StopReason::Error) {
-					keep_connection = handle_parse_error(tcp_id, *result.error, result.discard_bytes != 0);
+				{
+					// 这一批发往同一分片的请求只敲一次门铃，同一连接的响应只发起一次写；作用域内没有 co_await，离开时敲门、发起写。
+					Worker::BatchScope batch(worker_);
+					// 先执行成功解析的命令，确保响应顺序正确
+					execute_batch(result.commands, tcp_id);
+					if (result.stop == StopReason::Error) {
+						keep_connection = handle_parse_error(tcp_id, *result.error, result.discard_bytes != 0);
+					}
 				}
 				// 解析结果已投递后才能消费未解析输入
 				input.consume(result.consumed);
@@ -139,9 +143,12 @@ private:
 					co_await asio::async_read(socket, asio::buffer(rest.data(), rest.size()), use_awaitable);
 					pending.filled = pending.frame.size();
 					auto completed = MemcachedParser::complete(std::move(pending));
-					execute_batch(completed.commands, tcp_id);
-					if (completed.error) {
-						handle_parse_error(tcp_id, *completed.error, false); // BadDataChunk，可恢复
+					{
+						Worker::BatchScope batch(worker_);
+						execute_batch(completed.commands, tcp_id);
+						if (completed.error) {
+							handle_parse_error(tcp_id, *completed.error, false); // BadDataChunk，可恢复
+						}
 					}
 					continue;
 				}
@@ -186,8 +193,7 @@ private:
 	}
 
 	void run() {
-		asio::co_spawn(io_, worker_.mailbox_request_loop(), asio::detached);
-		asio::co_spawn(io_, worker_.mailbox_response_loop(), asio::detached);
+		asio::co_spawn(io_, worker_.mailbox_loop(), asio::detached);
 		asio::co_spawn(io_, accept_loop(), asio::detached);
 		io_.run();
 	}

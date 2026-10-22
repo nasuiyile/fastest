@@ -10,22 +10,32 @@ namespace fastest {
 namespace asio = boost::asio;
 using asio::awaitable;
 
-template <typename Message>
+// 一个分片的收件箱：收请求、收响应两个 MPSC mailbox，共用一个门铃。
+template <typename Request, typename Response>
+struct ShardInbox {
+	Doorbell doorbell;
+	Mailbox<Request> requests;
+	Mailbox<Response> responses;
+};
+
+template <typename Request, typename Response>
 class SharedSystem {
 public:
+	using Inbox = ShardInbox<Request, Response>;
+
 	explicit SharedSystem(std::size_t n) {
-		mailboxes_.reserve(n);
+		inboxes_.reserve(n);
 		for (std::size_t i = 0; i < n; ++i) {
-			mailboxes_.push_back(std::make_unique<Mailbox<Message>>());
+			inboxes_.push_back(std::make_unique<Inbox>());
 		}
 	}
 
 	[[nodiscard]] std::size_t size() const noexcept {
-		return mailboxes_.size();
+		return inboxes_.size();
 	}
 
-	Mailbox<Message> &mailbox(std::size_t id) noexcept {
-		return *mailboxes_[id];
+	Inbox &inbox(std::size_t id) noexcept {
+		return *inboxes_[id];
 	}
 
 	SharedSystem(const SharedSystem &) = delete;
@@ -33,29 +43,30 @@ public:
 	SharedSystem &operator=(const SharedSystem &) = delete;
 
 private:
-	std::vector<std::unique_ptr<Mailbox<Message>>> mailboxes_ {};
-	int event_fd_ {-1};
+	std::vector<std::unique_ptr<Inbox>> inboxes_ {};
 };
 
 template <typename Request, typename Response>
 class ShardComm {
 public:
+	using System = SharedSystem<Request, Response>;
+	using Inbox = typename System::Inbox;
+
 	static std::vector<ShardComm> create_shard_comm(const std::size_t num) {
 		std::vector<ShardComm> vec;
-		auto request_mailbox = std::make_shared<SharedSystem<Request>>(num);
-		auto response_mailbox = std::make_shared<SharedSystem<Response>>(num);
+		auto system = std::make_shared<System>(num);
 		for (std::size_t i = 0; i < num; ++i) {
-			vec.push_back(ShardComm(i, num, request_mailbox, response_mailbox));
+			vec.push_back(ShardComm(i, num, system));
 		}
 		return vec;
 	}
 
-	[[nodiscard]] inline Mailbox<Request> &current_request_mailbox() const {
-		return request_mailbox->mailbox(shard_id_);
+	[[nodiscard]] inline Inbox &current_inbox() const {
+		return system_->inbox(shard_id_);
 	}
 
-	[[nodiscard]] inline Mailbox<Response> &current_response_mailbox() const {
-		return response_mailbox->mailbox(shard_id_);
+	[[nodiscard]] inline Doorbell &doorbell(const std::size_t shard_id) const {
+		return system_->inbox(shard_id).doorbell;
 	}
 
 	[[nodiscard]] std::size_t current_shard_id() const {
@@ -69,20 +80,13 @@ public:
 		return shard_id == shard_id_;
 	}
 
-	bool send_request_to_shard(std::size_t shard_id, std::unique_ptr<Request> message) {
-		Mailbox<Request> &mailbox = request_mailbox->mailbox(shard_id);
-		if (mailbox.try_push(message)) {
-			return true;
-		}
-		return false;
+	// 只入队，不敲门；调用方（Worker）负责之后敲目标分片的门铃。
+	bool push_request(std::size_t shard_id, std::unique_ptr<Request> message) {
+		return system_->inbox(shard_id).requests.try_push(message);
 	}
 
-	bool send_response_shard(std::size_t shard_id, std::unique_ptr<Response> message) {
-		Mailbox<Response> &mailbox = response_mailbox->mailbox(shard_id);
-		if (mailbox.try_push(message)) {
-			return true;
-		}
-		return false;
+	bool push_response(std::size_t shard_id, std::unique_ptr<Response> message) {
+		return system_->inbox(shard_id).responses.try_push(message);
 	}
 
 	[[nodiscard]] inline std::size_t get_shard(const uint64_t hash) const {
@@ -98,17 +102,13 @@ public:
 	ShardComm &operator=(ShardComm &&) noexcept = default;
 
 private:
-	ShardComm(const std::size_t shard_id, const std::size_t shard_num,
-	          std::shared_ptr<SharedSystem<Request>> request_mailbox,
-	          std::shared_ptr<SharedSystem<Response>> response_mailbox)
-	    : shard_id_(shard_id), shard_num_(shard_num), request_mailbox(std::move(request_mailbox)),
-	      response_mailbox(std::move(response_mailbox)) {
+	ShardComm(const std::size_t shard_id, const std::size_t shard_num, std::shared_ptr<System> system)
+	    : shard_id_(shard_id), shard_num_(shard_num), system_(std::move(system)) {
 	}
 
 	std::size_t shard_id_ = 0;
 	// 分片总数
 	std::size_t shard_num_ = 0;
-	std::shared_ptr<SharedSystem<Request>> request_mailbox;
-	std::shared_ptr<SharedSystem<Response>> response_mailbox;
+	std::shared_ptr<System> system_;
 };
 } // namespace fastest

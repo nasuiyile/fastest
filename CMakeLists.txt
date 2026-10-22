@@ -82,6 +82,8 @@ add_test(NAME fastest_tests COMMAND fastest_tests)
 # Self-contained protocol tests; no external server is required.
 add_executable(fastest_protocol_tests tests/test_protocol.cpp)
 target_include_directories(fastest_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# 打开只在测试里需要的统计计数和门铃访问接口（Worker 的 WorkerStats）。
+target_compile_definitions(fastest_protocol_tests PRIVATE FASTEST_TESTING)
 target_link_libraries(fastest_protocol_tests PRIVATE
         Boost::asio Boost::intrusive Boost::system Boost::lockfree spdlog::spdlog Catch2::Catch2WithMain)
 add_test(NAME fastest_protocol_tests COMMAND fastest_protocol_tests)

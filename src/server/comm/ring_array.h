@@ -32,7 +32,7 @@ class RingArray {
 	              "RingResponseMessage must be nothrow move-constructible");
 
 public:
-	explicit RingArray(const std::size_t initial_capacity = 128, const std::uint32_t initial_seq = 0)
+	explicit RingArray(const std::size_t initial_capacity = 64, const std::uint32_t initial_seq = 0)
 	    : head_(initial_seq), next_id_(initial_seq) {
 		if (initial_capacity == 0 || initial_capacity > kHalfRange) {
 			throw std::invalid_argument("RingArray capacity must be in [1, 2^31]");
