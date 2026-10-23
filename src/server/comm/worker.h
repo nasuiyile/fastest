@@ -3,7 +3,6 @@
 #include <boost/asio.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -85,10 +84,7 @@ struct WorkerStats {
 	uint64_t mailbox_messages{0}; // 收件协程处理的消息数
 	uint64_t mailbox_sleeps{0};   // 收件协程在 fd 上睡下的次数
 	uint64_t socket_writes{0};    // 发起的 async_write 次数
-	uint64_t envelopes_sent{0};   // 推进别的分片收件队列的信封数（去程和回程，不含只带归还的信封）
-	uint64_t releases_sent{0};     // 送回 owner 的归还记录数（顺路搭车的和单独发的都算）
-	uint64_t release_envelopes{0}; // 只带归还记录的信封数（没有顺路信封时才发）
-	uint64_t releases_received{0}; // 作为 owner 收到并 release() 的归还记录数
+	uint64_t envelopes_sent{0};   // 推进别的分片收件队列的信封数（去程和回程）
 
 	void knocked(const bool wrote) noexcept {
 		doorbell_knocks += wrote;
@@ -96,18 +92,6 @@ struct WorkerStats {
 
 	void sent_envelope() noexcept {
 		++envelopes_sent;
-	}
-
-	void sent_releases(const std::size_t n) noexcept {
-		releases_sent += n;
-	}
-
-	void sent_release_envelope() noexcept {
-		++release_envelopes;
-	}
-
-	void received_releases(const std::size_t n) noexcept {
-		releases_received += n;
 	}
 
 	void wrote() noexcept {
@@ -128,15 +112,6 @@ struct WorkerStats {
 	void sent_envelope() noexcept {
 	}
 
-	void sent_releases(std::size_t) noexcept {
-	}
-
-	void sent_release_envelope() noexcept {
-	}
-
-	void received_releases(std::size_t) noexcept {
-	}
-
 	void wrote() noexcept {
 	}
 
@@ -148,19 +123,7 @@ struct WorkerStats {
 #endif
 };
 
-/*
- * 借出与归还（LoanSink）：本分片借给别人的 value 由本分片计数，借用方用完后把指针送回来。
- * - 每个 Worker 对每个 owner 分片攒一个归还列表（线程私有，不用 atomic）。ValueLoan 析构时 give_back() 记进去，
- *   owner 是本分片时直接 release()。
- * - 搭车：任何推向分片 s 的信封（本分片发给 s 的请求信封、执行完推回 s 的回程信封）都顺带装走发往 s 的归还记录，
- *   每个信封最多 Envelope::kReleaseCapacity 条。借用一定来自发往 owner 的请求，有负载时去 owner 的信封源源不断，
- *   归还几乎总能搭上车，不产生额外消息。
- * - 单独发：某个列表攒满一个信封的量（批次结束、写完成时检查），或者连续两次清扫（kReleaseSweepInterval）都没清空，
- *   才发一个只带归还的信封，并且不敲门（见 ShardComm::push_quiet）：owner 在睡说明它没有请求要处理，晚点释放不碍事；
- *   醒着就会在下一轮处理。
- * - owner 收到信封先 release() 归还区，再处理条目。
- */
-class Worker : public LoanSink {
+class Worker {
 public:
 	std::unordered_map<uint64_t, std::unique_ptr<TCPSession> > tcp_session_;
 	using Sc = ShardComm;
@@ -168,79 +131,19 @@ public:
 	explicit Worker(Sc shard_comm, std::shared_ptr<std::atomic_bool> stop)
 		: shard_comm_(std::move(shard_comm)), data_(static_cast<uint16_t>(shard_comm_.current_shard_id())),
 		  multi_key_index_(shard_comm_.shard_num()), stop_(std::move(stop)),
-		  doorbell_pending_mark_(shard_comm_.shard_num(), 0), open_envelopes_(shard_comm_.shard_num(), nullptr),
-		  release_out_(shard_comm_.shard_num()), release_mark_(shard_comm_.shard_num(), 0) {
+		  doorbell_pending_mark_(shard_comm_.shard_num(), 0), open_envelopes_(shard_comm_.shard_num(), nullptr) {
 		doorbell_pending_.reserve(shard_comm_.shard_num());
 		open_targets_.reserve(shard_comm_.shard_num());
 		envelope_pool_.reserve(kEnvelopePoolMax);
-		release_full_.reserve(shard_comm_.shard_num());
 	}
 
 	// 批次之间不会有打开的信封；在途的信封留在各分片的收件队列里，由队列析构释放。
-	// 析构只发生在停机后（所有分片线程都已停止）或测试里（分片都在同一个线程上），手里的归还记录直接在本线程 release()；
-	// 之后析构的连接里还借着的 value 也一样（tls_loan_sink 已不指向本对象）。
 	~Worker() {
-		if (tls_loan_sink == this) {
-			tls_loan_sink = nullptr;
-		}
-		for (std::vector<CacheValue *> &pending : release_out_) {
-			for (CacheValue *value : pending) {
-				value->release();
-			}
-			pending.clear();
-		}
 		for (Envelope *envelope : open_envelopes_) {
 			delete envelope;
 		}
 		for (Envelope *envelope : envelope_pool_) {
 			delete envelope;
-		}
-	}
-
-	// 分片线程启动时调用：本线程上析构的 ValueLoan 都交给这个 Worker 归还。
-	void bind_thread() noexcept {
-		tls_loan_sink = this;
-	}
-
-	// ValueLoan 析构时调用（任何时机：写完成、连接关闭、丢弃迟到响应、异常路径）。
-	void give_back(CacheValue *value, const uint16_t owner) noexcept override {
-		if (owner == shard_comm_.current_shard_id()) {
-			value->release(); // 同分片借出：直接减一
-			return;
-		}
-		std::vector<CacheValue *> &pending = release_out_[owner];
-		// 扩容失败会在这里 terminate：归还记录不能丢，丢了 value 就永远不释放，也不能在本线程替 owner 释放。
-		pending.push_back(value);
-		++release_pending_;
-		if (pending.size() >= Envelope::kReleaseCapacity && !(release_mark_[owner] & kReleaseFullMark)) {
-			release_mark_[owner] |= kReleaseFullMark;
-			release_full_.push_back(owner); // 预留了 shard_num 个，按标记去重，不会扩容
-		}
-		if (sweeper_idle_) {
-			wake_release_sweeper();
-		}
-	}
-
-	/*
-	 * 归还的兜底清扫：只在手里有归还记录时运行，每 kReleaseSweepInterval 看一次，
-	 * 连续两次都没被顺路信封清空的列表单独发出去（不敲门）。没有记录时挂在一个永不到期的定时器上，空闲时不占 CPU；
-	 * 第一条记录进来时 give_back() 取消这个等待把它叫醒。
-	 */
-	awaitable<void> release_sweeper() {
-		const auto executor = co_await asio::this_coro::executor;
-		sweep_timer_.emplace(executor);
-		while (!stop_->load(std::memory_order_relaxed)) {
-			boost::system::error_code ec;
-			if (release_pending_ == 0) {
-				sweeper_idle_ = true;
-				sweep_timer_->expires_at(asio::steady_timer::time_point::max());
-				co_await sweep_timer_->async_wait(redirect_error(use_awaitable, ec));
-				sweeper_idle_ = false;
-				continue;
-			}
-			sweep_timer_->expires_after(kReleaseSweepInterval);
-			co_await sweep_timer_->async_wait(redirect_error(use_awaitable, ec));
-			sweep_releases();
 		}
 	}
 
@@ -266,7 +169,6 @@ public:
 		~BatchScope() {
 			worker_.flush_outbound();
 			worker_.kick_dirty_sessions();
-			worker_.flush_full_releases();
 		}
 
 		BatchScope(const BatchScope &) = delete;
@@ -358,33 +260,6 @@ public:
 
 	[[nodiscard]] uint64_t envelopes_sent() const noexcept {
 		return stats_.envelopes_sent;
-	}
-
-	[[nodiscard]] uint64_t releases_sent() const noexcept {
-		return stats_.releases_sent;
-	}
-
-	[[nodiscard]] uint64_t release_envelopes() const noexcept {
-		return stats_.release_envelopes;
-	}
-
-	[[nodiscard]] uint64_t releases_received() const noexcept {
-		return stats_.releases_received;
-	}
-
-	// 还没送回 owner 的归还记录数。
-	[[nodiscard]] std::size_t releases_pending() const noexcept {
-		return release_pending_;
-	}
-
-	// 立即做一次清扫（相当于定时器到期一次）。
-	void sweep_releases_for_test() noexcept {
-		sweep_releases();
-	}
-
-	// 只读查看本分片的 value（不借出、不改计数）。
-	[[nodiscard]] const CacheValue *peek(const ItemKey &key) const {
-		return data_.peek(key);
 	}
 
 	[[nodiscard]] Doorbell &doorbell(const std::size_t shard) const noexcept {
@@ -622,10 +497,8 @@ private:
 	}
 
 	// 推进目标分片的收件队列（去程或回程），记下门铃，由 BatchScope 退出时（或攒满 kDoorbellFlushEvery 条时）统一敲门。
-	// 顺带装上发往这个分片的归还记录。
 	void send_envelope(const std::size_t shard, Envelope *envelope) noexcept {
 		const uint16_t messages = envelope->size();
-		attach_releases(shard, *envelope);
 		shard_comm_.push(shard, envelope);
 		stats_.sent_envelope();
 		if (!doorbell_pending_mark_[shard]) {
@@ -659,89 +532,6 @@ private:
 		}
 	}
 
-	// ---- 归还 ----
-	// 连续两次清扫都没清空的归还列表才单独发出，所以一条归还记录最多晚 2 倍间隔送回（只在没有顺路信封时）。
-	static constexpr std::chrono::milliseconds kReleaseSweepInterval{50};
-	static constexpr uint8_t kReleaseFullMark = 1;  // 已记进 release_full_
-	static constexpr uint8_t kReleaseStaleMark = 2; // 上次清扫时列表就不空，之后一直没被清空过
-
-	// 把发往 shard 的归还记录装进信封，装满为止。
-	void attach_releases(const std::size_t shard, Envelope &envelope) noexcept {
-		std::vector<CacheValue *> &pending = release_out_[shard];
-		if (pending.empty()) {
-			return;
-		}
-		const std::size_t n = envelope.take_releases(pending);
-		release_pending_ -= n;
-		stats_.sent_releases(n);
-		if (pending.empty()) {
-			release_mark_[shard] &= static_cast<uint8_t>(~kReleaseStaleMark);
-		}
-	}
-
-	// 只带归还记录的信封，搭不上顺路信封时才用；不敲门，除非别的消息可能卡在它后面（见 ShardComm::push_quiet）。
-	// 取信封失败（内存不足）时返回 false，记录留在列表里，下次再试。
-	bool send_release_envelope(const uint16_t shard) noexcept {
-		Envelope *envelope;
-		try {
-			envelope = acquire_envelope(shard);
-		} catch (...) {
-			return false;
-		}
-		attach_releases(shard, *envelope);
-		stats_.sent_release_envelope();
-		stats_.knocked(shard_comm_.push_quiet(shard, envelope));
-		return true;
-	}
-
-	// 别的分片发来的只带归还的信封：归还区已经处理过，装上本分片发往它的归还记录，推回去（同样不敲门）。
-	void return_release_envelope(Envelope &envelope) noexcept {
-		const uint16_t origin = envelope.origin();
-		envelope.mark_returned();
-		attach_releases(origin, envelope);
-		stats_.knocked(shard_comm_.push_quiet(origin, &envelope));
-	}
-
-	// 攒满一个信封的列表单独发出。批次结束和写完成时调用，没有满的列表时只是检查一个空 vector。
-	void flush_full_releases() noexcept {
-		for (const uint16_t shard : release_full_) {
-			release_mark_[shard] &= static_cast<uint8_t>(~kReleaseFullMark);
-			while (release_out_[shard].size() >= Envelope::kReleaseCapacity) {
-				if (!send_release_envelope(shard)) {
-					break;
-				}
-			}
-		}
-		release_full_.clear();
-	}
-
-	// 清扫：上次清扫时就不空、之后也没被顺路信封清空的列表，全部单独发出；其余的打上标记，下次再看。
-	void sweep_releases() noexcept {
-		for (std::size_t shard = 0; shard < release_out_.size(); ++shard) {
-			std::vector<CacheValue *> &pending = release_out_[shard];
-			if (pending.empty()) {
-				continue;
-			}
-			if (!(release_mark_[shard] & kReleaseStaleMark)) {
-				release_mark_[shard] |= kReleaseStaleMark;
-				continue;
-			}
-			while (!pending.empty()) {
-				if (!send_release_envelope(static_cast<uint16_t>(shard))) {
-					break;
-				}
-			}
-		}
-	}
-
-	void wake_release_sweeper() noexcept {
-		sweeper_idle_ = false;
-		try {
-			sweep_timer_->cancel();
-		} catch (...) {
-		}
-	}
-
 	// 一次 fence，然后每个目标分片敲一次；对端醒着时只是一次只读的标志检查。
 	void ring_doorbells() noexcept {
 		doorbell_pending_messages_ = 0;
@@ -764,16 +554,9 @@ private:
 		BatchScope batch(*this);
 		std::size_t handled = 0;
 		while (Envelope *envelope = mailbox.pop()) {
-			// 先归还：归还区里都是本分片借出去的 value。
-			stats_.received_releases(envelope->release_count());
-			envelope->release_values();
 			handled += envelope->size();
 			if (!envelope->returned()) {
-				if (envelope->size() == 0) {
-					return_release_envelope(*envelope); // 只带归还的信封，不算消息，不让收件协程因此保持醒着
-				} else {
-					execute_envelope(*envelope);
-				}
+				execute_envelope(*envelope);
 				continue;
 			}
 			ring_doorbells();
@@ -890,8 +673,7 @@ private:
 		}
 		TCPSession &session = *it->second;
 		session.writing = false;
-		session.release_sent(); // 借来的 value 在这里归还（记进归还列表）
-		flush_full_releases();
+		session.release_sent();
 		if (ec) {
 			if (ec != asio::error::broken_pipe && ec != asio::error::connection_reset && ec != asio::error::eof &&
 			    ec != asio::error::bad_descriptor && ec != asio::error::operation_aborted) {
@@ -973,15 +755,6 @@ private:
 	std::vector<uint16_t> open_targets_;
 	// 用完的空信封，下次直接取出，不再分配；最多留 kEnvelopePoolMax 个。
 	std::vector<Envelope *> envelope_pool_;
-
-	// 归还（都只由本线程访问）：按 owner 分片编号索引的归还列表、攒满一个信封的分片、每分片的标记位、记录总数。
-	std::vector<std::vector<CacheValue *> > release_out_;
-	std::vector<uint16_t> release_full_;
-	std::vector<uint8_t> release_mark_;
-	std::size_t release_pending_{0};
-	// 兜底清扫的定时器，由 release_sweeper() 在本分片的 io_context 上创建；没有记录时 sweeper_idle_ 为 true。
-	std::optional<asio::steady_timer> sweep_timer_;
-	bool sweeper_idle_{false};
 
 	// 统计计数，只在测试构建里存在。
 	[[no_unique_address]] WorkerStats stats_;

@@ -41,12 +41,6 @@ std::string shard_key(std::size_t shard) {
 	return shard_keys(shard, 1).front();
 }
 
-// 把一个独立的 value 包成借出凭证（编码测试用）：借出加一，形参析构减一，凭证持有唯一的计数。
-// 没有绑定 LoanSink 的线程上析构时直接 release()。
-ValueLoan loan_of(CacheValuePtr value, const std::uint16_t owner = 0) {
-	return ValueLoan::lend(value.get(), owner);
-}
-
 SingleKeyResponse cache_set(ShardCache &cache, const std::string &key, CacheValuePtr value) {
 	return cache.handle_single_command(SingleKeyCommand(SetCommand {ItemKey(key), std::move(value)}));
 }
@@ -344,8 +338,8 @@ TEST_CASE("multi-get waits for all shards before a subsequent parse error", "[pr
 
 TEST_CASE("GatherSink copies short fields contiguously and references long values", "[protocol]") {
 	const std::string big(4096, 'x');
-	const SingleKeyResponse small {SingleGetResponse {.item = ValueItem {"k", loan_of(CacheValue::create("v", 3))}}};
-	const SingleKeyResponse large {SingleGetResponse {.item = ValueItem {"big", loan_of(CacheValue::create(big))}}};
+	const SingleKeyResponse small {SingleGetResponse {.item = ValueItem {"k", CacheValue::create("v", 3)}}};
+	const SingleKeyResponse large {SingleGetResponse {.item = ValueItem {"big", CacheValue::create(big)}}};
 	GatherSink out;
 	REQUIRE_FALSE(encode_to(out, small));
 	REQUIRE_FALSE(encode_to(out, large));
@@ -368,8 +362,8 @@ TEST_CASE("GatherSink copies short fields contiguously and references long value
 TEST_CASE("GatherSink rollback drops a half-encoded response", "[protocol]") {
 	const SingleKeyResponse stored {SetResponse {}};
 	MultiGetResponse items;
-	items.items.push_back(ValueItem {"a", loan_of(CacheValue::create("1"))});
-	items.items.push_back(ValueItem {"bad key", loan_of(CacheValue::create("2"))});
+	items.items.push_back(ValueItem {"a", CacheValue::create("1")});
+	items.items.push_back(ValueItem {"bad key", CacheValue::create("2")});
 	const MultiKeyResponse bad {std::move(items)};
 	GatherSink out;
 	REQUIRE_FALSE(encode_to(out, stored));
@@ -503,17 +497,13 @@ TEST_CASE("RingArray keeps sent slots until release and drops their late replies
 }
 
 TEST_CASE("multi-key parts encode in arrival order with one END and no merge", "[protocol]") {
-	// 借出凭证只能移动，不能放进 initializer_list，逐个 push_back。
-	const auto items_of = [](std::initializer_list<std::pair<const char *, std::uint32_t>> entries) {
-		MultiGetResponse response;
-		for (const auto &[key, flags] : entries) {
-			response.items.push_back(ValueItem {key, loan_of(CacheValue::create(std::string(1, key[0] - 'a' + 'A'), flags))});
-		}
-		return response;
-	};
 	std::vector<ShardResponse> parts;
-	parts.push_back(ShardResponse {.count = 2, .command = MultiKeyResponse {items_of({{"a", 1}})}});
-	parts.push_back(ShardResponse {.count = 2, .command = MultiKeyResponse {items_of({{"b", 2}, {"c", 3}})}});
+	parts.push_back(ShardResponse {
+	    .count = 2, .command = MultiKeyResponse {MultiGetResponse {.items = {ValueItem {"a", CacheValue::create("A", 1)}}}}});
+	parts.push_back(ShardResponse {.count = 2,
+	                               .command = MultiKeyResponse {MultiGetResponse {
+	                                   .items = {ValueItem {"b", CacheValue::create("B", 2)},
+	                                             ValueItem {"c", CacheValue::create("C", 3)}}}}});
 	const auto project = [](const ShardResponse &part) -> const MultiKeyResponse & {
 		return part.command;
 	};
@@ -716,7 +706,7 @@ TEST_CASE("multi-get moves keys into the response and shares values", "[cache_va
 
 TEST_CASE("gets encodes the cas stored in the CacheValue", "[cache_value]") {
 	const SingleKeyResponse response {
-	    SingleGetsResponse {.item = CasValueItem {"k", loan_of(CacheValue::create("xyz", 4, 0, 99))}}};
+	    SingleGetsResponse {.item = CasValueItem {"k", CacheValue::create("xyz", 4, 0, 99)}}};
 	std::string wire;
 	detail::StringSink sink {wire};
 	REQUIRE_FALSE(encode_to(sink, response));
@@ -1723,269 +1713,4 @@ TEST_CASE("an awake mailbox keeps its doorbell up and an idle one sleeps with it
 	f.get(key);
 	REQUIRE(local.doorbell_knocks() == knocks + 2);
 	REQUIRE(f.read(reply.size()) == reply);
-}
-
-// ---- 借出与归还：owner 本地计数，借用方把用完的 value 送回 owner ----
-
-TEST_CASE("an envelope's release area fills from the back and releases what it carries", "[loan]") {
-	std::vector<CacheValue *> pending;
-	for (int i = 0; i != Envelope::kReleaseCapacity + 8; ++i) {
-		// 长 value：泄漏或重复释放都会被 ASan 发现
-		pending.push_back(CacheValue::create(std::string(100, static_cast<char>('a' + i % 26))).release_ownership());
-	}
-	CacheValue *const last = pending.back();
-	auto *envelope = new Envelope;
-	envelope->reset(0, 1);
-	REQUIRE(envelope->take_releases(pending) == Envelope::kReleaseCapacity);
-	REQUIRE(envelope->release_full());
-	REQUIRE(pending.size() == 8);
-	REQUIRE(std::find(pending.begin(), pending.end(), last) == pending.end()); // 从尾部搬走
-	REQUIRE(envelope->take_releases(pending) == 0);                             // 满了不再装
-	envelope->release_values();                                                 // owner 处理：逐个 release()
-	REQUIRE(envelope->release_count() == 0);
-	REQUIRE(envelope->take_releases(pending) == 8);
-	REQUIRE(pending.empty());
-	delete envelope; // 停机时残留在队列里的信封：析构时直接归还
-}
-
-TEST_CASE("a remote GET's loan rides back to its owner on the next envelope", "[loan]") {
-	WorkerFixture f;
-	Worker &local = f.workers[0];
-	Worker &remote = f.workers[1];
-	local.bind_thread(); // 两个分片在同一个线程上：本线程析构的借出凭证交给连接所在的分片
-	const auto key = shard_key(1);
-	f.set(key, "hello");
-	f.start_mailboxes();
-	REQUIRE(f.read(8) == "STORED\r\n");
-	const CacheValue *raw = remote.peek(ItemKey(key));
-	REQUIRE(raw != nullptr);
-	REQUIRE(raw->use_count() == 1); // 只有 map
-
-	const std::string reply = "VALUE " + key + " 0 5\r\nhello\r\nEND\r\n";
-	f.get(key);
-	REQUIRE(f.read(reply.size()) == reply);
-	// 写完成：借出凭证析构，记进发往 owner 的归还列表；owner 的计数没人碰，还是 map + 一次借出。
-	f.until([&] { return local.releases_pending() == 1; });
-	REQUIRE(raw->use_count() == 2);
-	REQUIRE(remote.releases_received() == 0);
-
-	// 下一个发往 owner 的请求信封顺带捎回去，不产生额外的信封。
-	const uint64_t envelopes = local.envelopes_sent();
-	f.get(key);
-	REQUIRE(local.envelopes_sent() == envelopes + 1);
-	REQUIRE(local.releases_sent() == 1);
-	REQUIRE(local.release_envelopes() == 0);
-	REQUIRE(f.read(reply.size()) == reply);
-	f.until([&] { return remote.releases_received() == 1 && local.releases_pending() == 1; });
-	REQUIRE(raw->use_count() == 2); // 第一次的已归还，第二次的还在归还列表里
-}
-
-TEST_CASE("without an envelope to the owner, loans go back quietly after two sweeps", "[loan]") {
-	WorkerFixture f;
-	Worker &local = f.workers[0];
-	Worker &remote = f.workers[1];
-	Doorbell &remote_bell = local.doorbell(1);
-	local.bind_thread();
-	const auto keys = shard_keys(1, 2);
-	f.set(keys[0], "v");
-	f.start_mailboxes();
-	REQUIRE(f.read(8) == "STORED\r\n");
-	const CacheValue *raw = remote.peek(ItemKey(keys[0]));
-	f.get(keys[0]);
-	const std::string reply = "VALUE " + keys[0] + " 0 1\r\nv\r\nEND\r\n";
-	REQUIRE(f.read(reply.size()) == reply);
-	f.until([&] {
-		return local.releases_pending() == 1 && remote.mailbox_sleeps() >= 1 && !remote_bell.is_rung();
-	}); // owner 空闲，睡在 fd 上
-
-	const uint64_t knocks = local.doorbell_knocks();
-	local.sweep_releases_for_test(); // 第一次只打标记：也许马上就有顺路信封
-	REQUIRE(local.release_envelopes() == 0);
-	REQUIRE(local.releases_pending() == 1);
-	local.sweep_releases_for_test(); // 两次都没清空：单独发
-	REQUIRE(local.release_envelopes() == 1);
-	REQUIRE(local.releases_pending() == 0);
-	REQUIRE(local.doorbell_knocks() == knocks); // 不敲门：owner 在睡，说明它不缺内存
-	for (int i = 0; i != 5; ++i) {
-		f.io.restart();
-		f.io.run_one_for(5ms);
-	}
-	REQUIRE(remote.releases_received() == 0); // 还在 owner 的收件队列里
-	REQUIRE(raw->use_count() == 2);
-
-	// owner 因为别的请求醒来，先处理归还。
-	f.get(keys[1]);
-	REQUIRE(f.read(5) == "END\r\n");
-	f.until([&] { return remote.releases_received() == 1; });
-	REQUIRE(raw->use_count() == 1);
-}
-
-TEST_CASE("a loan returned with the next command lets incr rewrite in place", "[loan]") {
-	WorkerFixture f;
-	Worker &local = f.workers[0];
-	Worker &remote = f.workers[1];
-	local.bind_thread();
-	const auto key = shard_key(1);
-	f.set(key, "10");
-	f.start_mailboxes();
-	REQUIRE(f.read(8) == "STORED\r\n");
-	const CacheValue *raw = remote.peek(ItemKey(key));
-	f.get(key);
-	const std::string reply = "VALUE " + key + " 0 2\r\n10\r\nEND\r\n";
-	REQUIRE(f.read(reply.size()) == reply);
-	f.until([&] { return local.releases_pending() == 1; });
-	REQUIRE(raw->use_count() == 2);
-	{
-		Worker::BatchScope scope(local);
-		local.send_single_command(SingleKeyCommand(IncrCommand {ItemKey(key), 5}), WorkerFixture::id);
-	}
-	REQUIRE(f.read(4) == "15\r\n");
-	// 归还区先于条目处理：incr 执行时借出已经归还，只剩 map 持有，原地改写，不分配新 value。
-	REQUIRE(remote.releases_received() == 1);
-	REQUIRE(remote.peek(ItemKey(key)) == raw);
-	REQUIRE(raw->view() == "15");
-}
-
-TEST_CASE("a loan whose session is gone still goes back to its owner", "[loan]") {
-	WorkerFixture f;
-	Worker &local = f.workers[0];
-	Worker &remote = f.workers[1];
-	local.bind_thread();
-	const auto key = shard_key(1);
-	f.set(key, std::string(1000, 'x'));
-	f.start_mailboxes();
-	REQUIRE(f.read(8) == "STORED\r\n");
-	const CacheValue *raw = remote.peek(ItemKey(key));
-	f.get(key);
-	// 响应还在回程上，连接就没了：迟到的响应被丢弃，借出凭证随之析构。
-	local.tcp_session_.erase(WorkerFixture::id);
-	f.until([&] { return local.releases_pending() == 1; });
-	REQUIRE(raw->use_count() == 2);
-	local.sweep_releases_for_test();
-	local.sweep_releases_for_test();
-	REQUIRE(local.release_envelopes() == 1);
-	// owner 可能在睡（不敲门）：从测试里敲一下，模拟它被别的请求叫醒。
-	local.doorbell(1).ring();
-	f.until([&] { return remote.releases_received() == 1; });
-	REQUIRE(raw->use_count() == 1);
-}
-
-TEST_CASE("a quiet producer stuck mid-push knocks for the message queued behind it", "[loan][doorbell]") {
-	// 确定性地走一遍「卡在两步之间」：安静生产者 Q 交换了尾指针还没链接，普通生产者 P 排在后面、链接好、敲了门；
-	// 消费者醒来却在 Q 的前驱处停下（pop 返回空），放下门铃、复查仍为空，准备睡。P 的敲门已经被这次醒来用掉，
-	// 只能由 Q 链接完成后敲门，否则 P 的消息一直没人处理。
-	Doorbell bell;
-	MpscQueue<TestNode> queue;
-	const int fd = bell.duplicate_event_fd();
-	REQUIRE(fd >= 0);
-	bell.raise(); // 消费者醒着
-
-	auto *q = new TestNode(1, 0);
-	MpscHook *const prev = queue.begin_push_for_test(q); // Q：交换了尾指针，还没链接
-	queue.push(new TestNode(0, 0));                      // P：排在 Q 后面
-	bell.lower();                                        // 消费者：一轮为空，准备睡
-	REQUIRE(bell.ring());                                // P：门铃放下了，敲门
-	drain_eventfd(fd);                                   // 消费者醒来
-	REQUIRE(queue.pop() == nullptr);                     // 卡在 Q 的前驱
-	bell.lower();
-	REQUIRE(queue.pop() == nullptr); // 复查仍为空：要睡了
-	REQUIRE_FALSE(doorbell_pending(fd));
-
-	REQUIRE(queue.finish_push_quiet_for_test(prev, q)); // Q：链接完成，发现后面有节点
-	REQUIRE(bell.knock());                              // 门铃是放下的：Q 替 P 敲门
-	REQUIRE(doorbell_pending(fd));
-	drain_eventfd(fd);
-	TestNode *first = queue.pop();
-	TestNode *second = queue.pop();
-	REQUIRE(first == q);
-	REQUIRE(second != nullptr);
-	REQUIRE(second->producer == 0);
-	delete first;
-	delete second;
-
-	// 后面没有节点时，安静生产者不敲门：队列里只有它自己，不用叫醒任何人。
-	bell.lower();
-	REQUIRE_FALSE(queue.push_quiet(new TestNode(1, 1)));
-	REQUIRE_FALSE(doorbell_pending(fd));
-	::close(fd); // 残留节点由队列析构释放
-}
-
-TEST_CASE("producers that push quietly never strand a normal producer's wakeup", "[loan][doorbell]") {
-	// 和「concurrent producers never lose a doorbell wakeup」一样的消费者协议，另加一个只 push_quiet 的生产者
-	// （模拟只带归还的信封）。普通消息丢一次唤醒就会卡住，poll 超时；安静的消息可以留到最后。
-	constexpr int kNormal = 2;
-	constexpr uint64_t kPerProducer = 50000;
-	constexpr uint64_t kNormalTotal = kNormal * kPerProducer;
-	Doorbell bell;
-	MpscQueue<TestNode> queue;
-	std::atomic<bool> done {false};
-	std::atomic<uint64_t> quiet_knocks {0};
-	std::vector<std::thread> producers;
-	for (int p = 0; p < kNormal; ++p) {
-		producers.emplace_back([&, p] {
-			std::minstd_rand rng(static_cast<unsigned>(p + 7));
-			for (uint64_t sent = 0; sent < kPerProducer;) {
-				const uint64_t batch = std::min<uint64_t>(1 + rng() % 8, kPerProducer - sent);
-				for (uint64_t i = 0; i < batch; ++i, ++sent) {
-					queue.push(new TestNode(static_cast<uint32_t>(p), sent));
-				}
-				bell.ring();
-				for (unsigned spin = rng() % 16384; spin != 0; --spin) {
-					asm volatile("" ::: "memory");
-				}
-			}
-		});
-	}
-	std::thread quiet([&] {
-		std::minstd_rand rng(99);
-		uint64_t sent = 0;
-		while (!done.load(std::memory_order_relaxed)) {
-			if (queue.push_quiet(new TestNode(kNormal, sent++))) {
-				quiet_knocks += bell.knock();
-			}
-			for (unsigned spin = rng() % 4096; spin != 0; --spin) {
-				asm volatile("" ::: "memory");
-			}
-		}
-	});
-
-	const int fd = bell.duplicate_event_fd();
-	REQUIRE(fd >= 0);
-	uint64_t normal = 0;
-	bool lost_wakeup = false;
-	const auto drain = [&] {
-		std::size_t n = 0;
-		while (TestNode *node = queue.pop()) {
-			normal += node->producer != kNormal;
-			n += node->producer != kNormal; // 安静的消息不算「有活」，和只带归还的信封一样不让消费者保持醒着
-			delete node;
-		}
-		return n;
-	};
-	while (normal < kNormalTotal) {
-		if (drain() != 0) {
-			continue;
-		}
-		bell.lower();
-		if (drain() != 0) {
-			bell.raise();
-			continue;
-		}
-		pollfd pfd {fd, POLLIN, 0};
-		if (::poll(&pfd, 1, 5000) != 1) {
-			lost_wakeup = true;
-			break;
-		}
-		drain_eventfd(fd);
-	}
-	done = true;
-	for (auto &producer : producers) {
-		producer.join();
-	}
-	quiet.join();
-	drain();
-	::close(fd);
-	REQUIRE_FALSE(lost_wakeup);
-	REQUIRE(normal == kNormalTotal);
-	WARN("quiet producer knocked " << quiet_knocks.load() << " times (someone was queued behind it)");
 }

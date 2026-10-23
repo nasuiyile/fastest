@@ -163,7 +163,7 @@ struct MpscHook {
  * 析构时 delete 残留节点（只在 shutdown 时发生）。
  */
 template <typename Node>
-    requires std::derived_from<Node, MpscHook>
+	requires std::derived_from<Node, MpscHook>
 class MpscQueue {
 public:
 	MpscQueue() noexcept : tail_(&stub_), head_(&stub_) {
@@ -182,35 +182,6 @@ public:
 	void push(Node *node) noexcept {
 		link(node);
 	}
-
-	/*
-	 * 不打算敲门的生产者用（只带归还记录、不急着处理的信封）：链接完成后做一次 seq_cst fence，
-	 * 返回此时是否已经有别的节点排在它后面。
-	 *
-	 * 为什么要看后面：push 分两步，本节点「交换了尾指针、还没链接」期间，排在后面的生产者 P 即使链接好、敲了门，
-	 * 消费者 pop 到本节点的前驱就停下（返回空），放下门铃、复查仍为空就睡了，P 的那次敲门已经被这次醒来用掉。
-	 * 普通生产者链接完成后都会再检查一次门铃，由它把消费者叫醒；不敲门的生产者也必须接住这个责任：
-	 * 后面有节点、并且门铃是放下的，就要敲门。后面没有节点时，队列里卡住的只有自己，不需要叫醒任何人。
-	 * 调用方随后读门铃（knock() 要求的 fence 已经在这里做过）。
-	 * 读的是队列自己的尾指针，不读节点：节点链接之后随时可能被消费者取走、复用甚至释放。
-	 */
-	[[nodiscard]] bool push_quiet(Node *node) noexcept {
-		link(node);
-		return queued_behind(node);
-	}
-
-#if defined(FASTEST_TESTING)
-	// 只给测试用：把 push_quiet 拆成「交换尾指针」和「链接前驱 + 检查」两步，构造生产者卡在两步之间的情形。
-	MpscHook *begin_push_for_test(Node *node) noexcept {
-		node->next.store(nullptr, std::memory_order_relaxed);
-		return tail_.exchange(node, std::memory_order_acq_rel);
-	}
-
-	[[nodiscard]] bool finish_push_quiet_for_test(MpscHook *prev, Node *node) noexcept {
-		prev->next.store(node, std::memory_order_release);
-		return queued_behind(node);
-	}
-#endif
 
 	// 只有消费者调用。队列为空，或者唯一的后继还没被生产者链接上时，返回 nullptr。
 	Node *pop() noexcept {
@@ -242,11 +213,6 @@ public:
 	}
 
 private:
-	[[nodiscard]] bool queued_behind(const Node *node) const noexcept {
-		std::atomic_thread_fence(std::memory_order_seq_cst);
-		return tail_.load(std::memory_order_relaxed) != node;
-	}
-
 	void link(MpscHook *node) noexcept {
 		node->next.store(nullptr, std::memory_order_relaxed);
 		MpscHook *prev = tail_.exchange(node, std::memory_order_acq_rel);
@@ -255,6 +221,6 @@ private:
 
 	alignas(kCacheLinePair) std::atomic<MpscHook *> tail_; // 生产者 exchange
 	alignas(kCacheLinePair) MpscHook *head_;               // 只有消费者读写
-	MpscHook stub_;                                        // 队列空时的占位节点
+	MpscHook stub_;                                         // 队列空时的占位节点
 };
 } // namespace fastest

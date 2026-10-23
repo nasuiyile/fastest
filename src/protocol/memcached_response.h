@@ -67,18 +67,18 @@ struct CasResponse {
 	CasStatus status = CasStatus::Stored;
 };
 
-// 命中项借用 map 里的 CacheValue（owner 加一次普通计数，不复制 value 字节）；flags、长度、cas 都取自 value（发布后只读）。
+// 命中项共享 map 里的 CacheValue（只加一次引用计数，不复制 value 字节）；flags、长度、cas 都取自 value。
 // key 从命令里移动过来。GatherSink 对超过 kInlineBytes 的 value 直接引用 CacheValue 的 payload+CRLF，
-// CacheValue 地址稳定且发布后只读；响应对象（以及它持有的借出凭证）必须活到写完成，析构时把 value 送回 owner。
+// CacheValue 地址稳定且发布后只读；响应对象（以及它持有的这次引用）必须活到写完成。
 struct ValueItem {
 	std::string key;
-	ValueLoan value;
+	CacheValuePtr value;
 };
 
 // 与 ValueItem 字段相同；独立类型只用于让 gets/gats 在编码时额外输出 value->cas。
 struct CasValueItem {
 	std::string key;
-	ValueLoan value;
+	CacheValuePtr value;
 };
 
 template <ResponseType Type, typename Item>

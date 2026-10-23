@@ -21,8 +21,7 @@ namespace fastest {
 // 单个分片的数据，只能由所属线程访问。语义按 memcached 1.6（do_store_item / do_add_delta / do_item_touch）。
 // map_（ExpiredMap）里每个 CacheValue* 持有一次引用计数：插入时从命令接管，覆盖/删除/过期/析构时 release()。
 // 所有命令都经过惰性过期：过期的 value 按不存在处理并顺手删除；主动过期由外部调用 sample_expired()。
-// 读取只借出（ValueLoan::lend，普通整数加一）交给响应，value 字节从解析到写出 socket 都不再复制；
-// 借用方用完后把指针送回本分片减一（见 ValueLoan / Worker::give_back），计数只有本线程读写。
+// 读取只 share() 加一次计数交给响应，value 字节从解析到写出 socket 都不再复制。
 // 写入新 value 都经过 publish() / ExpiredMap::insert()：value 的 flags、expired_at 在解析时已经是最终值，
 // 这里只分配新的 cas 版本号。append/prepend、incr/decr 生成的新 value 沿用旧值的 flags 和过期时间。
 // 原地修改只有两处：touch/gat 改 expired_at（经过 ExpiredMap::touch() 维护 TTL 计数），
@@ -271,7 +270,7 @@ private:
 		// find() 顺带推进一步增量 rehash；已过期的当作未命中并删除。
 		if (CacheValue *value = map_.find(command.key)) {
 			touch_on_hit(value, command);
-			response.item.emplace(Item {std::move(command.key.key), ValueLoan::lend(value, shard_id_)});
+			response.item.emplace(Item {std::move(command.key.key), CacheValuePtr::share(value)});
 		}
 		// 未命中时 item 为空，编码器只输出 END。
 		return response;
@@ -288,7 +287,7 @@ private:
 		for (ItemKey &key : command.keys) {
 			if (CacheValue *value = map_.find(key, now)) {
 				touch_on_hit(value, command);
-				response.items.push_back(Item {std::move(key.key), ValueLoan::lend(value, shard_id_)});
+				response.items.push_back(Item {std::move(key.key), CacheValuePtr::share(value)});
 			}
 		}
 		return response;
@@ -323,8 +322,7 @@ private:
 	// 写回结果与 memcached do_add_delta 的原地替换逐字节相同：新数字不比旧数据长时，长度不变、剩余部分补空格
 	// （之后 get 会看到尾部空格）；数字变长时长度刚好装下数字。flags、过期时间不变，cas 换新。
 	// - value 只被 map 持有（memcached 的 refcount == 2）时原地改写：不分配，也不改 map 的内存计数。
-	// - 有在途响应引用旧值（借出还没归还）时分配新 value，旧值留给在途响应。归还是批量送回的，可能比写完成晚一些，
-	//   这时同样走分配新 value 的路径，结果逐字节相同（都补空格）。memcached 每条 get 的回复写完才执行同一连接的下一条命令，
+	// - 有在途响应引用旧值时分配新 value，旧值留给在途响应。memcached 每条 get 的回复写完才执行同一连接的下一条命令，
 	//   所以同一连接看到的总是原地替换的结果；这里的在途引用可能来自同一连接的流水线，因此新 value 也补空格，
 	//   保证结果与执行时机无关（memcached 只在其他连接持有引用时才会给出不补空格的结果，协议允许两者）。
 	void store_number(const ItemKey &key, CacheValue &value, const std::uint64_t number) {

@@ -20,7 +20,7 @@ namespace fastest {
 // 发送方用 front() + advance() 原地编码，不把响应搬出槽位；写完成后 release_sent() 一次性释放。
 //
 // 扩容会移动在途槽位。这是安全的，因为 GatherSink 只引用超过 kInlineBytes 的段：
-// value 的 payload 在 ValueLoan 指向的独立堆对象里，地址不随槽位移动；key 不超过 250B，总是拷进 arena；
+// value 的 payload 在 CacheValuePtr 指向的独立堆对象里，地址不随槽位移动；key 不超过 250B，总是拷进 arena；
 // ErrorResponse::message 是 string_view，指向静态字符串。以后给响应加字段时要保持这一点。
 class RingArray {
 	using MultiResponses = std::vector<ShardResponse>;

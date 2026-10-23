@@ -193,10 +193,7 @@ private:
 	}
 
 	void run() {
-		// 本线程上析构的借出凭证（ValueLoan）都交给本分片的 Worker 归还。
-		worker_.bind_thread();
 		asio::co_spawn(io_, worker_.mailbox_loop(), asio::detached);
-		asio::co_spawn(io_, worker_.release_sweeper(), asio::detached);
 		asio::co_spawn(io_, accept_loop(), asio::detached);
 		io_.run();
 	}
