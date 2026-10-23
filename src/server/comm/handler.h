@@ -78,11 +78,11 @@ private:
 	};
 
 	awaitable<void> session(const uint64_t tcp_id) {
-		auto it = worker_.tcp_session_.find(tcp_id);
-		if (it == worker_.tcp_session_.end()) {
+		TCPSession *const found = worker_.sessions().find(tcp_id);
+		if (found == nullptr) {
 			co_return;
 		}
-		TCPSession &tcp_session = *it->second;
+		TCPSession &tcp_session = *found;
 		tcp::socket &socket = tcp_session.socket;
 		std::size_t shard_id = worker_.current_shard_id();
 		try {
@@ -97,7 +97,7 @@ private:
 					input.consume(dropped);
 					discard_remaining -= dropped;
 					if (discard_remaining == 0) {
-						worker_.finish_swallow(tcp_id);
+						worker_.sessions().finish_swallow(tcp_id);
 						continue;
 					}
 					// 缓冲区已空：读一块，下一轮循环再丢弃。
@@ -179,7 +179,7 @@ private:
 		// ring. Keep the session object until the ordered writer closes it.
 		tcp_session.session_exited = true;
 		// 有写在途时不能回收（ring_array 的已发送槽位还被引用），由写回调结束时回收。
-		worker_.reclaim_session_if_idle(tcp_id, tcp_session);
+		worker_.sessions().reclaim_if_idle(tcp_id, tcp_session);
 	}
 
 	awaitable<void> wait_for_backlog(TCPSession &session) {
@@ -238,9 +238,8 @@ private:
 			}
 			// 响应已经在 kick_write 里按批合并，不需要 Nagle；否则批次末尾的小段会和客户端的延迟 ACK 互相等待约 40ms。
 			socket.set_option(tcp::no_delay(true), ec);
-			auto ptr = std::make_unique<TCPSession>(std::move(socket));
 			uint64_t id = tcp_id_++;
-			worker_.tcp_session_.emplace(id, std::move(ptr));
+			worker_.sessions().add(id, std::move(socket));
 			asio::co_spawn(executor, session(id), asio::detached);
 		}
 	}

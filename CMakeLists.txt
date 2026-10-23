@@ -27,6 +27,8 @@ add_executable(fastest
         src/server/comm/ring_array.h
         src/server/comm/mailbox.h
         src/server/comm/envelope.h
+        src/server/comm/outbox.h
+        src/server/comm/session.h
         src/server/comm/worker.h
         src/server/comm/shard.h
         src/server/comm/shard.h

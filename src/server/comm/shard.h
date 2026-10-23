@@ -78,9 +78,9 @@ public:
 		return shard_id == shard_id_;
 	}
 
-	// 只入队，不敲门；调用方（Worker）负责之后敲目标分片的门铃。信封交给目标分片的队列。
-	void push(const std::size_t shard_id, Envelope *envelope) const noexcept {
-		system_->inbox(shard_id).mailbox.push(envelope);
+	// 所有分片的收件箱；跨分片发件（Outbox）直接持有它，入队和敲门不再经过 ShardComm。
+	[[nodiscard]] System &system() const noexcept {
+		return *system_;
 	}
 
 	[[nodiscard]] inline std::size_t get_shard(const uint64_t hash) const {

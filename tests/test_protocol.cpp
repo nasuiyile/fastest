@@ -88,7 +88,7 @@ struct WorkerFixture {
 		tcp::acceptor acceptor(io, {asio::ip::address_v4::loopback(), 0});
 		client.connect(acceptor.local_endpoint());
 		auto socket = acceptor.accept();
-		workers[0].tcp_session_.emplace(id, std::make_unique<TCPSession>(std::move(socket)));
+		workers[0].sessions().add(id, std::move(socket));
 	}
 
 	~WorkerFixture() {
@@ -96,7 +96,11 @@ struct WorkerFixture {
 		io.stop();
 	}
 
-	TCPSession &session() { return *workers[0].tcp_session_.at(id); }
+	TCPSession &session() {
+		TCPSession *session = workers[0].sessions().find(id);
+		REQUIRE(session != nullptr);
+		return *session;
+	}
 
 	void start_mailboxes() {
 		for (auto &worker : workers) {
@@ -272,7 +276,7 @@ TEST_CASE("fatal errors drain earlier remote replies before closing and reclaimi
 	REQUIRE_FALSE(f.session().closing);
 	REQUIRE(f.session().ring_array.next_id() == 0);
 	f.start_mailboxes();
-	f.until([&] { return !f.workers[0].tcp_session_.contains(f.id); });
+	f.until([&] { return f.workers[0].sessions().find(f.id) == nullptr; });
 	const std::string expected = "END\r\nCLIENT_ERROR command line too long\r\n";
 	REQUIRE(f.read(expected.size()) == expected);
 	char byte;
@@ -311,7 +315,7 @@ TEST_CASE("oversized SET removes old values in the same shard order as successfu
 		REQUIRE(f.session().ring_array.next_id() == 1);
 		REQUIRE(f.read(8) == "STORED\r\n");
 		REQUIRE(f.client.available() == 0); // error is waiting for the discarded body
-		f.workers[0].finish_swallow(f.id);
+		f.workers[0].sessions().finish_swallow(f.id);
 		const std::string expected = "SERVER_ERROR object too large for cache\r\nEND\r\n";
 		REQUIRE(f.read(expected.size()) == expected);
 	}
@@ -452,11 +456,11 @@ TEST_CASE("a session waiting for its batched write is reclaimed only after the w
 		f.queue_get(shard_key(0)); // 入环，等作用域结束再写
 		REQUIRE(f.session().kick_pending);
 		f.session().session_exited = true;
-		worker.reclaim_session_if_idle(f.id, f.session());
-		REQUIRE(worker.tcp_session_.contains(f.id)); // 还在待写列表里：不能回收
+		worker.sessions().reclaim_if_idle(f.id, f.session());
+		REQUIRE(worker.sessions().find(f.id) != nullptr); // 还在待写列表里：不能回收
 	}
 	REQUIRE(f.read(5) == "END\r\n");
-	f.until([&] { return !worker.tcp_session_.contains(f.id); }); // 写完成后由写回调回收
+	f.until([&] { return worker.sessions().find(f.id) == nullptr; }); // 写完成后由写回调回收
 }
 
 TEST_CASE("RingArray keeps sent slots until release and drops their late replies", "[ring]") {
